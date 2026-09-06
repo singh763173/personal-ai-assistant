@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# One-shot backend setup script for the Ollama Bee Device / AI Assistant.
+# One-shot backend setup script for the Personal AI Assistant.
 # Run on an Ubuntu/Debian host (VM, LXC, or bare metal) that will receive
 # audio and images from the Pi device.
 #
@@ -13,8 +13,11 @@
 #   - Creates and enables the bee-backend systemd service
 #   - Prints clear instructions for authorizing Ollama.com cloud models
 #
-# IMPORTANT: You must manually log into ollama.com and add an API key before
-#            cloud models like kimi-k2.7-code:cloud will work.
+# Environment variables (all optional):
+#   OLLAMA_MODEL      - default: kimi-k2.7-code:cloud
+#   WHISPER_MODEL     - default: base
+#   OLLAMA_URL        - default: http://localhost:11434
+#   BEE_GITHUB_REPO   - default: https://github.com/singh763173/personal-ai-assistant
 #
 set -euo pipefail
 
@@ -30,17 +33,20 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
+log_step()  { echo -e "${BLUE}[STEP]${NC} $1"; }
 
 if [[ $EUID -ne 0 ]]; then
     log_error "This script must be run as root. Try: sudo bash install-backend.sh"
     exit 1
 fi
 
-log_info "Ollama Bee / AI Assistant backend installer"
+log_info "Personal AI Assistant backend installer"
+log_info "Backend directory: $BACKEND_DIR"
+log_info "Ollama URL:        $OLLAMA_URL"
+log_info "Ollama model:      $OLLAMA_MODEL"
 
 # ---------------------------------------------------------------------------
 # 1. Update system
@@ -55,16 +61,18 @@ apt install -y curl wget git python3-pip python3-venv ffmpeg net-tools
 # ---------------------------------------------------------------------------
 if ! command -v ollama &> /dev/null; then
     log_step "Installing Ollama..."
-    curl -fsSL https://ollama.com/install.sh | sh
+    if ! curl -fsSL https://ollama.com/install.sh | sh; then
+        log_error "Ollama installation failed."
+        exit 1
+    fi
 else
     log_info "Ollama is already installed: $(ollama --version)"
 fi
 
-# Ensure Ollama service is running
 log_step "Starting Ollama service..."
 systemctl enable --now ollama
 
-# Wait for Ollama to be reachable
+log_step "Waiting for Ollama API..."
 for i in {1..30}; do
     if curl -s "$OLLAMA_URL/api/tags" > /dev/null 2>&1; then
         log_info "Ollama API is reachable at $OLLAMA_URL"
@@ -87,7 +95,10 @@ if [[ -f "${BASH_SOURCE[0]:-$0}" ]] && [[ -d "$(dirname "${BASH_SOURCE[0]:-$0}")
 else
     log_info "Downloading backend files from GitHub..."
     TMP_DIR=$(mktemp -d)
-    git clone --depth 1 "$GITHUB_REPO" "$TMP_DIR"
+    if ! git clone --depth 1 "$GITHUB_REPO" "$TMP_DIR"; then
+        log_error "Failed to clone $GITHUB_REPO"
+        exit 1
+    fi
     cp -r "$TMP_DIR/backend"/* "$BACKEND_DIR/"
     rm -rf "$TMP_DIR"
 fi
@@ -120,9 +131,12 @@ log_step "Creating bee-backend systemd service..."
 useradd -r -s /bin/false bee-backend 2>/dev/null || log_warn "bee-backend user already exists"
 chown -R bee-backend:bee-backend "$BACKEND_DIR"
 
+# Use a reliable LAN IP for the final health hint.
+HEALTH_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'YOUR_BACKEND_IP')"
+
 cat > /etc/systemd/system/bee-backend.service <<EOF
 [Unit]
-Description=Bee Pioneer / AI Assistant Backend
+Description=Personal AI Assistant Backend
 After=network.target ollama.service
 Requires=ollama.service
 
@@ -175,8 +189,9 @@ Before it can work, you must:
 
 8. Test the backend health endpoint:
 
-   ${YELLOW}curl http://$(hostname -I | awk '{print $1}'):8000/health${NC}
+   ${YELLOW}curl http://$HEALTH_IP:8000/health${NC}
 
 EOF
 
 log_info "Backend setup is complete. Ollama is installed but cloud authorization is still required."
+log_info "Rebooting is not required, but may be useful for clean startup of all services."

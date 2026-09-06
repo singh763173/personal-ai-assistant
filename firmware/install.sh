@@ -1,23 +1,28 @@
 #!/bin/bash
 #
-# One-shot setup script for the Ollama Bee Device (PiSugar Whisplay HAT + PiSugar 3 + Camera Module 3).
+# One-shot setup script for the Personal AI Assistant (PiSugar Whisplay HAT + PiSugar 3 + Camera Module 3).
 # Run on a fresh Raspberry Pi OS Lite (64-bit) install on a Pi Zero W / Zero 2 W.
 #
 # What this does:
+#   - Updates system packages
 #   - Installs system dependencies (alsa, i2c, libcamera, ffmpeg, etc.)
 #   - Installs the PiSugar Whisplay HAT driver
 #   - Installs the PiSugar power manager for battery monitoring
-#   - Enables I2C and camera overlays
+#   - Enables I2C, SPI, I2S and camera overlays
+#   - Adds the pi user to required hardware groups
 #   - Creates a Python venv with project dependencies
 #   - Downloads the firmware files from GitHub if not already present
 #   - Configures and enables the bee-device systemd service
-#   - Prompts for the backend URL
-#   - Uses the Kimi k2.7-code:cloud model via Ollama
+#
+# Environment variables (all optional):
+#   BEE_BACKEND_URL   - backend URL (default: http://192.168.1.86:8000)
+#   BEE_DEVICE_ID     - device identifier (default: bee-pioneer-01)
+#   BEE_GITHUB_REPO   - source repo (default: https://github.com/singh763173/personal-ai-assistant)
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/YOUR_REPO/main/install.sh | sudo bash
-#   OR
-#   sudo bash install.sh
+#   curl -fsSL https://raw.githubusercontent.com/singh763173/personal-ai-assistant/main/firmware/install.sh | sudo bash
+#   OR (with custom backend):
+#   curl -fsSL ... | sudo BEE_BACKEND_URL=http://192.168.1.10:8000 BEE_DEVICE_ID=bedside-01 bash
 #
 set -euo pipefail
 
@@ -25,20 +30,25 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 PROJECT_DIR="/opt/bee-device"
+SERVICE_USER="bee-device"
 BACKEND_URL="${BEE_BACKEND_URL:-http://192.168.1.86:8000}"
 DEVICE_ID="${BEE_DEVICE_ID:-bee-pioneer-01}"
-OLLAMA_MODEL="${OLLAMA_MODEL:-kimi-k2.7-code:cloud}"
 GITHUB_REPO="${BEE_GITHUB_REPO:-https://github.com/singh763173/personal-ai-assistant}"
+
+# The PiSugar Whisplay unified driver exposes the ALSA card 'whisplaysound'.
+AUDIO_CARD="whisplaysound"
 
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step()  { echo -e "${BLUE}[STEP]${NC} $1"; }
 
 # ---------------------------------------------------------------------------
 # Pre-flight checks
@@ -48,30 +58,26 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-log_info "Ollama Bee Device one-shot installer"
-log_info "Target directory: $PROJECT_DIR"
-log_info "Default backend: $BACKEND_URL"
-log_info "Default Ollama model: $OLLAMA_MODEL"
+if ! grep -q "Raspberry Pi" /proc/device-tree/model 2>/dev/null; then
+    log_warn "This installer is intended for Raspberry Pi. Continuing anyway..."
+fi
 
-# Ask for backend URL
-read -rp "Enter backend URL [$BACKEND_URL]: " input_backend
-BACKEND_URL="${input_backend:-$BACKEND_URL}"
-
-# Ask for device ID
-read -rp "Enter device ID [$DEVICE_ID]: " input_device
-DEVICE_ID="${input_device:-$DEVICE_ID}"
+log_info "Personal AI Assistant one-shot installer"
+log_info "Backend URL:   $BACKEND_URL"
+log_info "Device ID:     $DEVICE_ID"
+log_info "Source repo:   $GITHUB_REPO"
 
 # ---------------------------------------------------------------------------
 # 1. Update system
 # ---------------------------------------------------------------------------
-log_info "Updating system packages..."
+log_step "Updating system packages..."
 apt update
 apt full-upgrade -y
 
 # ---------------------------------------------------------------------------
 # 2. Install system dependencies
 # ---------------------------------------------------------------------------
-log_info "Installing system dependencies..."
+log_step "Installing system dependencies..."
 apt install -y \
     python3-pip \
     python3-venv \
@@ -81,56 +87,82 @@ apt install -y \
     curl \
     i2c-tools \
     libcamera-dev \
+    libcamera-apps-lite \
     alsa-utils \
     arecord \
-    ffmpeg
+    ffmpeg \
+    raspberrypi-kernel-headers \
+    dkms \
+    build-essential
 
 # ---------------------------------------------------------------------------
-# 3. Enable interfaces and camera overlay
+# 3. Enable hardware interfaces
 # ---------------------------------------------------------------------------
-log_info "Configuring /boot/firmware/config.txt..."
+log_step "Configuring /boot/firmware/config.txt..."
 CONFIG=/boot/firmware/config.txt
 
-# Enable I2C
-if ! grep -q "^dtparam=i2c_arm=on" "$CONFIG"; then
-    echo "dtparam=i2c_arm=on" >> "$CONFIG"
-fi
+ensure_config() {
+    local key="$1"
+    local value="$2"
+    if ! grep -q "^${value}" "$CONFIG" 2>/dev/null; then
+        echo "$value" >> "$CONFIG"
+    fi
+}
 
-# Camera Module 3 overlay
-if ! grep -q "^dtoverlay=imx708" "$CONFIG"; then
-    echo "dtoverlay=imx708" >> "$CONFIG"
-    echo "start_x=1" >> "$CONFIG"
-    echo "gpu_mem=128" >> "$CONFIG"
-fi
+# Core buses used by Whisplay HAT and PiSugar
+ensure_config "dtparam=i2c_arm"  "dtparam=i2c_arm=on"
+ensure_config "dtparam=spi"      "dtparam=spi=on"
+ensure_config "dtparam=i2s"      "dtparam=i2s=on"
 
-# Optional: disable Bluetooth if you want lower power consumption (uncomment if desired)
-# echo "dtoverlay=disable-bt" >> "$CONFIG"
+# Camera Module 3
+ensure_config "dtoverlay=imx708" "dtoverlay=imx708"
+
+# Legacy camera stack settings (harmless on Bookworm, required on Bullseye)
+ensure_config "start_x=1"        "start_x=1"
+ensure_config "gpu_mem=128"      "gpu_mem=128"
 
 # ---------------------------------------------------------------------------
-# 4. Install PiSugar Whisplay HAT driver
+# 4. Add pi user to hardware groups
 # ---------------------------------------------------------------------------
-log_info "Installing PiSugar Whisplay HAT driver..."
+log_step "Adding 'pi' user to hardware groups..."
+for group in gpio i2c spi audio video input; do
+    usermod -aG "$group" pi 2>/dev/null || true
+done
+
+# ---------------------------------------------------------------------------
+# 5. Install PiSugar Whisplay HAT driver
+# ---------------------------------------------------------------------------
+log_step "Installing PiSugar Whisplay HAT driver..."
 WHISPLAY_DIR="/tmp/Whisplay"
-if [[ -d "$WHISPLAY_DIR" ]]; then
-    rm -rf "$WHISPLAY_DIR"
+rm -rf "$WHISPLAY_DIR"
+
+if ! git clone --depth 1 https://github.com/PiSugar/Whisplay.git "$WHISPLAY_DIR"; then
+    log_error "Failed to clone PiSugar/Whisplay repository. Check network."
+    exit 1
 fi
-git clone --depth 1 https://github.com/PiSugar/Whisplay.git "$WHISPLAY_DIR"
+
 cd "$WHISPLAY_DIR"
-bash install_driver.sh
+# The installer prompts "Proceed? [y/N]"; pre-answer yes for unattended operation.
+yes | bash install_driver.sh || {
+    log_error "Whisplay driver installation failed. See output above."
+    exit 1
+}
 
 # ---------------------------------------------------------------------------
-# 5. Install PiSugar power manager (battery monitoring)
+# 6. Install PiSugar power manager (battery monitoring)
 # ---------------------------------------------------------------------------
-log_info "Installing PiSugar power manager..."
+log_step "Installing PiSugar power manager..."
 if ! command -v pisugar-power-manager &> /dev/null; then
-    curl -fsSL https://cdn.pisugar.com/release/Pisugar-power-manager.sh | bash
+    if ! curl -fsSL https://cdn.pisugar.com/release/Pisugar-power-manager.sh | bash; then
+        log_warn "PiSugar power manager install failed. Battery metrics may not be available."
+    fi
 fi
-systemctl enable --now pisugar-server || log_warn "pisugar-server may already be running or needs a reboot"
+systemctl enable --now pisugar-server 2>/dev/null || log_warn "pisugar-server may need a reboot before it starts cleanly"
 
 # ---------------------------------------------------------------------------
-# 6. Create project directory and download firmware
+# 7. Create project directory and download firmware
 # ---------------------------------------------------------------------------
-log_info "Setting up project directory: $PROJECT_DIR..."
+log_step "Setting up project directory: $PROJECT_DIR..."
 mkdir -p "$PROJECT_DIR"
 cd "$PROJECT_DIR"
 
@@ -142,48 +174,63 @@ if [[ -f "${BASH_SOURCE[0]:-$0}" ]] && [[ -d "$(dirname "${BASH_SOURCE[0]:-$0}")
 else
     log_info "Downloading firmware from GitHub..."
     TMP_DIR=$(mktemp -d)
-    git clone --depth 1 "$GITHUB_REPO" "$TMP_DIR"
+    if ! git clone --depth 1 "$GITHUB_REPO" "$TMP_DIR"; then
+        log_error "Failed to clone $GITHUB_REPO"
+        exit 1
+    fi
     cp -r "$TMP_DIR/firmware"/* "$PROJECT_DIR/"
     rm -rf "$TMP_DIR"
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Create Python virtual environment
+# 8. Create dedicated service user
 # ---------------------------------------------------------------------------
-log_info "Creating Python virtual environment..."
+log_step "Creating $SERVICE_USER service user..."
+if ! id "$SERVICE_USER" &>/dev/null; then
+    useradd -r -s /bin/false -G gpio,i2c,spi,audio,video,input "$SERVICE_USER"
+fi
+usermod -aG gpio,i2c,spi,audio,video,input "$SERVICE_USER" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 9. Create Python virtual environment
+# ---------------------------------------------------------------------------
+log_step "Creating Python virtual environment..."
 python3 -m venv "$PROJECT_DIR/venv"
 source "$PROJECT_DIR/venv/bin/activate"
 pip install --upgrade pip
 pip install -r "$PROJECT_DIR/requirements.txt"
 
 # ---------------------------------------------------------------------------
-# 8. Configure environment file
+# 10. Configure environment file
 # ---------------------------------------------------------------------------
-log_info "Writing environment configuration..."
+log_step "Writing environment configuration..."
 cat > "$PROJECT_DIR/.env" <<EOF
 BEE_BACKEND_URL=$BACKEND_URL
 BEE_DEVICE_ID=$DEVICE_ID
 BEE_CHUNK_SECONDS=30
 BEE_SAMPLE_RATE=16000
 BEE_AUDIO_CHANNELS=2
-BEE_AUDIO_CARD=whisplay-soundcard
+BEE_AUDIO_CARD=$AUDIO_CARD
 BEE_ENABLE_CAMERA=true
 BEE_CAMERA_INTERVAL=300
 BEE_PISUGAR_API=http://localhost:8423
 EOF
 
+chown -R "$SERVICE_USER:$SERVICE_USER" "$PROJECT_DIR"
+
 # ---------------------------------------------------------------------------
-# 9. Create systemd service
+# 11. Create systemd service
 # ---------------------------------------------------------------------------
-log_info "Creating bee-device systemd service..."
+log_step "Creating bee-device systemd service..."
 cat > /etc/systemd/system/bee-device.service <<EOF
 [Unit]
-Description=Bee Pioneer AI Recorder (Whisplay HAT + PiSugar 3)
+Description=Personal AI Assistant Recorder (Whisplay HAT + PiSugar 3)
 After=network.target whisplay-daemon.service pisugar-server.service
 
 [Service]
 Type=simple
-User=root
+User=$SERVICE_USER
+Group=$SERVICE_USER
 WorkingDirectory=$PROJECT_DIR
 EnvironmentFile=$PROJECT_DIR/.env
 ExecStart=$PROJECT_DIR/venv/bin/python $PROJECT_DIR/recorder.py
@@ -198,43 +245,48 @@ systemctl daemon-reload
 systemctl enable bee-device.service
 
 # ---------------------------------------------------------------------------
-# 10. Create backend configuration note
+# 12. Post-install verification
 # ---------------------------------------------------------------------------
-log_info "Writing backend configuration reminder..."
-cat > "$PROJECT_DIR/BACKEND_SETUP.md" <<EOF
-# Backend Setup Required
+log_step "Post-install checks..."
 
-The Pi firmware is configured to send audio/images to:
-
-  $BACKEND_URL
-
-You must run the backend on that host. Steps:
-
-1. Copy the 'backend/' directory to the host.
-2. Install dependencies:
-     python3 -m venv venv
-     source venv/bin/activate
-     pip install -r requirements.txt
-3. Set environment variables:
-     export OLLAMA_URL=http://localhost:11434
-     export OLLAMA_MODEL=$OLLAMA_MODEL
-     export WHISPER_MODEL=base
-     export WHISPER_DEVICE=cpu
-4. Run:
-     uvicorn main:app --host 0.0.0.0 --port 8000
-
-Or use the provided backend/README.md for systemd service setup.
-EOF
-
-# ---------------------------------------------------------------------------
-# 11. Reboot
-# ---------------------------------------------------------------------------
-log_info "Installation complete. A reboot is required to load device-tree overlays and drivers."
-read -rp "Reboot now? [Y/n]: " reboot_now
-reboot_now="${reboot_now:-Y}"
-if [[ "$reboot_now" =~ ^[Yy]$ ]]; then
-    log_info "Rebooting..."
-    reboot
+if aplay -l 2>/dev/null | grep -qi "whisplay"; then
+    log_info "Whisplay sound card detected in ALSA."
 else
-    log_warn "Please reboot manually when ready: sudo reboot"
+    log_warn "Whisplay sound card not visible yet. A reboot is required."
 fi
+
+if i2cdetect -y 1 2>/dev/null | grep -qE "[0-9a-f]{2}"; then
+    log_info "I2C bus is active."
+else
+    log_warn "I2C devices not detected yet. Reboot required."
+fi
+
+# ---------------------------------------------------------------------------
+# 13. Final instructions
+# ---------------------------------------------------------------------------
+cat <<EOF
+
+$(log_info "Installation complete.")
+
+A reboot is required to load device-tree overlays and the Whisplay driver.
+Run:
+
+  ${YELLOW}sudo reboot${NC}
+
+After reboot, verify the hardware:
+
+  ${YELLOW}aplay -l | grep -i whisplay${NC}
+  ${YELLOW}i2cdetect -y 1${NC}
+  ${YELLOW}libcamera-hello --list-cameras${NC}
+  ${YELLOW}curl http://localhost:8423/api/power${NC}
+
+Then check the service:
+
+  ${YELLOW}sudo systemctl status bee-device${NC}
+
+Backend is configured to:
+
+  ${YELLOW}$BACKEND_URL${NC}
+
+Make sure the backend is installed, Ollama is authorized, and the backend is running.
+EOF
