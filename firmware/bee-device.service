@@ -1,0 +1,26 @@
+# Systemd service for the Bee device recorder (Whisplay HAT + PiSugar 3)
+# Copy to /etc/systemd/system/bee-device.service
+
+[Unit]
+Description=Bee Pioneer AI Recorder (Whisplay HAT + PiSugar 3)
+After=network.target whisplay-daemon.service pisugar-server.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/bee-device
+Environment=BEE_BACKEND_URL=http://192.168.1.86:8000
+Environment=BEE_DEVICE_ID=bee-pioneer-01
+Environment=BEE_CHUNK_SECONDS=30
+Environment=BEE_SAMPLE_RATE=16000
+Environment=BEE_AUDIO_CHANNELS=2
+Environment=BEE_AUDIO_CARD=whisplay-soundcard
+Environment=BEE_ENABLE_CAMERA=true
+Environment=BEE_CAMERA_INTERVAL=300
+Environment=BEE_PISUGAR_API=http://localhost:8423
+ExecStart=/home/pi/bee-device/venv/bin/python /home/pi/bee-device/recorder.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

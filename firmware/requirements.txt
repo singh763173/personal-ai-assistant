@@ -1,0 +1,7 @@
+requests>=2.31.0
+RPi.GPIO>=0.7.1
+python-dotenv>=1.0.0
+Pillow>=10.0.0
+picamera2>=0.3.12
+# PiSugar Whisplay HAT runtime (installed by their driver, not on PyPI)
+# If not available, the firmware falls back to console-only operation.
