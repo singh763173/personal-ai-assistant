@@ -22,7 +22,7 @@ BACKEND_DIR="${BACKEND_DIR:-/opt/bee-backend}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-kimi-k2.7-code:cloud}"
 WHISPER_MODEL="${WHISPER_MODEL:-base}"
-GITHUB_REPO="${BEE_GITHUB_REPO:-https://github.com/singh763173/ollama-bee-device}"
+GITHUB_REPO="${BEE_GITHUB_REPO:-https://github.com/singh763173/personal-ai-assistant}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

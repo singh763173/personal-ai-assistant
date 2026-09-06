@@ -28,7 +28,7 @@ PROJECT_DIR="/opt/bee-device"
 BACKEND_URL="${BEE_BACKEND_URL:-http://192.168.1.86:8000}"
 DEVICE_ID="${BEE_DEVICE_ID:-bee-pioneer-01}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-kimi-k2.7-code:cloud}"
-GITHUB_REPO="${BEE_GITHUB_REPO:-https://github.com/singh763173/ollama-bee-device}"
+GITHUB_REPO="${BEE_GITHUB_REPO:-https://github.com/singh763173/personal-ai-assistant}"
 
 # Colors
 RED='\033[0;31m'

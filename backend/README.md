@@ -24,7 +24,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 Flash Raspberry Pi OS Lite (64-bit), enable SSH, then run the one-shot installer on the Pi:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/singh763173/ollama-bee-device/main/firmware/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/singh763173/personal-ai-assistant/main/firmware/install.sh | sudo bash
 ```
 
 The installer will:

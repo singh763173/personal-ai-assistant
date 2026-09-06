@@ -1,4 +1,4 @@
-# Ollama Bee Device
+# Personal AI Assistant
 
 A self-hosted, wearable AI companion that streams audio to a local backend for transcription (faster-whisper) and sends the transcript to Ollama for summarization and action extraction.
 
@@ -20,7 +20,7 @@ A self-hosted, wearable AI companion that streams audio to a local backend for t
 ## Project Structure
 
 ```
-ollama-bee-device/
+personal-ai-assistant/
 ├── backend/       FastAPI server + transcription + Ollama integration
 ├── firmware/      Raspberry Pi device software + one-shot installer
 ├── hardware/      BOM, build guides, compatibility check, shopping list
@@ -35,21 +35,36 @@ ollama-bee-device/
 On your Proxmox VM/LXC or AIServer01 host:
 
 ```bash
+# One-shot backend installer (installs Ollama, Whisper deps, and backend service)
+curl -fsSL https://raw.githubusercontent.com/singh763173/personal-ai-assistant/main/backend/install-backend.sh | sudo bash
+
+# Then authorize Ollama cloud access:
+ollama login
+ollama list
+```
+
+Or manually:
+
+```bash
 cd backend
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+
+export OLLAMA_URL=http://localhost:11434
+export OLLAMA_MODEL=kimi-k2.7-code:cloud
+export WHISPER_MODEL=base
+export WHISPER_DEVICE=cpu
+
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
-
-The backend defaults to `OLLAMA_MODEL=kimi-k2.7-code:cloud`.
 
 ### 2. Pi Device
 
 Flash Raspberry Pi OS Lite (64-bit), enable SSH, then run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/singh763173/ollama-bee-device/main/firmware/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/singh763173/personal-ai-assistant/main/firmware/install.sh | sudo bash
 ```
 
 The installer will:
@@ -74,6 +89,25 @@ View conversations:
 curl http://YOUR_BACKEND_IP:8000/conversations
 ```
 
+## Cloud Authorization (Required for Kimi)
+
+Before the backend can use `kimi-k2.7-code:cloud`:
+
+1. Go to https://ollama.com and sign in.
+2. Generate an API key in your account settings.
+3. On the backend host, run:
+
+```bash
+ollama login
+```
+
+4. Paste your API key.
+5. Verify the model is available:
+
+```bash
+ollama list
+```
+
 ## Privacy
 
 Audio is transcribed locally on your backend. Only the text transcript is sent to the cloud LLM via Ollama. No audio recordings leave your network unless you choose a cloud transcription provider.
@@ -85,6 +119,7 @@ Audio is transcribed locally on your backend. Only the text transcript is sent t
 - `hardware/SHOPPING_LIST.md` — product links to buy everything
 - `backend/README.md` — backend setup and deployment
 - `firmware/install.sh` — one-shot Pi setup script
+- `backend/install-backend.sh` — one-shot backend setup script
 
 ## License
 
