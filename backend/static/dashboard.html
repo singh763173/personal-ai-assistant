@@ -34,7 +34,12 @@
 <body>
   <header>
     <h1>🐝 Bee Backend Dashboard</h1>
-    <span class="muted" id="health">Checking health…</span>
+    <div>
+      <span class="muted" id="health">Checking health…</span>
+      <form method="post" action="/api/v1/logout" style="display:inline; margin-left:1rem;">
+        <button type="submit" class="secondary" style="width:auto; font-size:0.75rem;">Logout</button>
+      </form>
+    </div>
   </header>
   <div class="container">
     <div class="grid">
@@ -44,8 +49,6 @@
         <input id="deviceId" placeholder="e.g. bee-pocket-02">
         <label for="deviceName">Friendly name (optional)</label>
         <input id="deviceName" placeholder="e.g. Ajay's pocket unit">
-        <label for="adminToken">Admin token</label>
-        <input id="adminToken" type="password" placeholder="BEE_ADMIN_TOKEN value">
         <button id="onboardBtn" style="margin-top:0.75rem">Generate API key</button>
         <div id="onboardResult" style="margin-top:1rem; display:none;">
           <p class="muted">API key (shown once):</p>
@@ -88,19 +91,10 @@
       setTimeout(() => el.style.display = 'none', 4000);
     };
 
-    async function getAdminToken() {
-      let token = document.getElementById('adminToken').value.trim();
-      if (!token) token = localStorage.getItem('beeAdminToken') || '';
-      if (!token) throw new Error('Admin token required');
-      localStorage.setItem('beeAdminToken', token);
-      document.getElementById('adminToken').value = token;
-      return token;
-    }
-
     async function api(path, opts={}) {
-      const token = await getAdminToken();
+      const token = await ();
       const res = await fetch(path, {
-        headers: { 'Authorization': token, 'Accept': 'application/json', ...(opts.headers||{}) },
+        headers: { 'Accept': 'application/json', ...(opts.headers||{}) },
         ...opts
       });
       if (!res.ok) {

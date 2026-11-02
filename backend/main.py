@@ -15,24 +15,24 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
 import requests
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Depends, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Depends, Request, status, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from faster_whisper import WhisperModel
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
+import bcrypt
+from jose import jwt, JWTError
 
 app = FastAPI(title="Ollama Bee Backend")
 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    from fastapi.responses import JSONResponse, HTMLResponse
     if request.headers.get("accept", "").startswith("application/json"):
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
-    # For browser requests return a simple HTML page
     return HTMLResponse(
         status_code=exc.status_code,
         content=f"""<!DOCTYPE html>
@@ -53,13 +53,21 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "kimi-k2.7-code:cloud")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-API_KEY_HEADER = os.getenv("BEE_API_KEY_HEADER", "Authorization")
+
+ADMIN_USERNAME = os.getenv("BEE_ADMIN_USERNAME", "")
+ADMIN_PASSWORD_HASH = os.getenv("BEE_ADMIN_PASSWORD_HASH", "")
+SECRET_KEY = os.getenv("BEE_SECRET_KEY", "")
+SESSION_COOKIE_NAME = "bee_session"
+SESSION_MAX_AGE_HOURS = 7 * 24
 
 # Security
-MAX_UPLOAD_BYTES = int(os.getenv("BEE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))  # 20 MB
+MAX_UPLOAD_BYTES = int(os.getenv("BEE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 MAX_DEVICES = int(os.getenv("BEE_MAX_DEVICES", "50"))
 RATE_LIMIT_SECONDS = float(os.getenv("BEE_RATE_LIMIT_SECONDS", "5"))
-ADMIN_TOKEN = os.getenv("BEE_ADMIN_TOKEN", "")
+
+if not SECRET_KEY:
+    SECRET_KEY = secrets.token_urlsafe(32)
+    print(f"[WARN] BEE_SECRET_KEY not set; generated one-time key: {SECRET_KEY[:8]}...")
 
 # Database
 DB_PATH = Path(__file__).parent / "bee.db"
@@ -132,8 +140,35 @@ def _hash_key(key: str) -> str:
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def _hash_password(plain: str) -> str:
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+
+
+def _create_session_token(username: str) -> str:
+    exp = _now() + timedelta(hours=SESSION_MAX_AGE_HOURS)
+    return jwt.encode({"sub": username, "exp": exp}, SECRET_KEY, algorithm="HS256")
+
+
+def _get_session_user(request: Request) -> Optional[str]:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+
 def _extract_token(request: Request, credentials: Optional[HTTPAuthorizationCredentials]) -> str:
-    # FastAPI HTTPBearer strips the scheme; also accept raw header value.
     if credentials and credentials.credentials:
         token = credentials.credentials.strip()
         if token.lower().startswith("bearer "):
@@ -148,25 +183,15 @@ def _extract_token(request: Request, credentials: Optional[HTTPAuthorizationCred
     return ""
 
 
-async def _verify_admin_from_request(request: Request):
-    """Middleware-style dependency that requires admin token for browser/API access."""
-    if not ADMIN_TOKEN:
-        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Admin token not configured")
-    token = _extract_token(request, None)
-    if token != ADMIN_TOKEN:
+def _require_admin_session(request: Request):
+    user = _get_session_user(request)
+    if user != ADMIN_USERNAME:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required. Provide the admin token in the Authorization header.",
+            detail="Login required",
             headers={"WWW-Authenticate": "Bearer"},
         )
-
-
-def _require_admin(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
-    if not ADMIN_TOKEN:
-        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Admin token not configured")
-    if _extract_token(request, credentials) != ADMIN_TOKEN:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin token")
-    return True
+    return user
 
 
 def _require_device(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security), db: SessionLocal = Depends(get_db)):
@@ -183,7 +208,6 @@ def _require_device(request: Request, credentials: Optional[HTTPAuthorizationCre
 
 
 def _rate_limit(request: Request, device: Device = Depends(_require_device)):
-    # Simple in-memory per-device rate limit
     now = _now()
     last = getattr(app.state, "rate_limit_cache", {})
     key = device.device_id
@@ -229,7 +253,18 @@ Respond ONLY as valid JSON with this exact structure:
         r.raise_for_status()
         data = r.json()
         raw = data.get("response", "")
-        parsed = json.loads(raw)
+        if not raw or not raw.strip():
+            return {"summary": "No response from model", "todos": [], "type": "empty", "raw": raw}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            # Some cloud models return markdown fences around JSON
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.strip("`").strip()
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:].strip()
+            parsed = json.loads(cleaned)
         return {
             "summary": parsed.get("summary", ""),
             "todos": parsed.get("todos", []),
@@ -251,46 +286,73 @@ async def security_headers(request: Request, call_next):
 
 @app.middleware("http")
 async def admin_gate(request: Request, call_next):
-    """Require admin token for all browser-facing and admin endpoints.
+    """Require admin session for all browser-facing and admin endpoints.
 
     Publicly accessible:
       - /api/v1/health       (uptime probe)
       - /api/v1/upload       (wearable devices via API key)
-    Everything else is gated.
+      - /login               (login form/page)
+      - /api/v1/login        (login submission)
+    Everything else requires an authenticated session.
     """
-    from fastapi.responses import JSONResponse, HTMLResponse
-
     path = request.url.path
-    public_paths = {"/api/v1/health", "/api/v1/upload"}
+    public_paths = {"/api/v1/health", "/api/v1/upload", "/login", "/api/v1/login"}
     if path in public_paths:
         return await call_next(request)
+    if path.startswith("/static/"):
+        pass
 
-    if not ADMIN_TOKEN:
-        detail = "Admin token not configured"
-        status_code = status.HTTP_501_NOT_IMPLEMENTED
-    else:
-        token = _extract_token(request, None)
-        if token == ADMIN_TOKEN:
-            return await call_next(request)
-        detail = "Authentication required. Provide the admin token in the Authorization header."
-        status_code = status.HTTP_401_UNAUTHORIZED
+    user = _get_session_user(request)
+    if user != ADMIN_USERNAME:
+        if request.headers.get("accept", "").startswith("application/json"):
+            return JSONResponse(status_code=401, content={"detail": "Login required"}, headers={"WWW-Authenticate": "Bearer"})
+        return RedirectResponse(url="/login", status_code=302)
+    return await call_next(request)
 
-    headers = {"WWW-Authenticate": "Bearer"}
-    if request.headers.get("accept", "").startswith("application/json"):
-        return JSONResponse(status_code=status_code, content={"detail": detail}, headers=headers)
-    return HTMLResponse(
-        status_code=status_code,
-        content=f"""<!DOCTYPE html>
-<html><head><title>{status_code}</title></head>
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    login_path = Path(__file__).parent / "static" / "login.html"
+    if login_path.exists():
+        return HTMLResponse(content=login_path.read_text())
+    return HTMLResponse(content="""<!DOCTYPE html>
+<html><head><title>Login</title></head>
 <body style="font-family:system-ui; background:#0f172a; color:#e2e8f0; padding:2rem;">
-<h1>{status_code}</h1>
-<p>{detail}</p>
-</body></html>""",
-        headers=headers,
+<h1>Login</h1>
+<form method="post" action="/api/v1/login">
+<input name="username" placeholder="Username" style="padding:0.5rem; margin:0.25rem;" required><br>
+<input name="password" type="password" placeholder="Password" style="padding:0.5rem; margin:0.25rem;" required><br>
+<button type="submit" style="padding:0.5rem 1rem; margin:0.25rem;">Login</button>
+</form>
+</body></html>""")
+
+
+@app.post("/api/v1/login")
+async def login(username: str = Form(...), password: str = Form(...)):
+    if not ADMIN_USERNAME or not ADMIN_PASSWORD_HASH:
+        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Admin credentials not configured")
+    if username != ADMIN_USERNAME or not _verify_password(password, ADMIN_PASSWORD_HASH):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
+    token = _create_session_token(username)
+    response = RedirectResponse(url="/dashboard", status_code=302)
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=SESSION_MAX_AGE_HOURS * 3600,
     )
+    return response
 
 
-@app.post("/api/v1/onboard", response_model=OnboardResponse, dependencies=[Depends(_require_admin)])
+@app.post("/api/v1/logout")
+async def logout(response: Response):
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return RedirectResponse(url="/login", status_code=302)
+
+
+@app.post("/api/v1/onboard", response_model=OnboardResponse, dependencies=[Depends(_require_admin_session)])
 async def onboard_device(req: OnboardRequest, db: SessionLocal = Depends(get_db)):
     if db.query(Device).count() >= MAX_DEVICES:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Maximum {MAX_DEVICES} devices reached")
@@ -308,7 +370,7 @@ async def onboard_device(req: OnboardRequest, db: SessionLocal = Depends(get_db)
     return OnboardResponse(device_id=req.device_id, api_key=api_key)
 
 
-@app.get("/api/v1/devices", dependencies=[Depends(_require_admin)])
+@app.get("/api/v1/devices", dependencies=[Depends(_require_admin_session)])
 async def list_devices(db: SessionLocal = Depends(get_db)):
     rows = db.query(Device).order_by(Device.created_at.desc()).all()
     return [
@@ -324,7 +386,7 @@ async def list_devices(db: SessionLocal = Depends(get_db)):
     ]
 
 
-@app.post("/api/v1/devices/{device_id}/rotate", dependencies=[Depends(_require_admin)])
+@app.post("/api/v1/devices/{device_id}/rotate", dependencies=[Depends(_require_admin_session)])
 async def rotate_device_key(device_id: str, db: SessionLocal = Depends(get_db)):
     device = db.query(Device).filter(Device.device_id == device_id).first()
     if not device:
@@ -335,7 +397,7 @@ async def rotate_device_key(device_id: str, db: SessionLocal = Depends(get_db)):
     return {"device_id": device_id, "api_key": api_key}
 
 
-@app.post("/api/v1/devices/{device_id}/toggle", dependencies=[Depends(_require_admin)])
+@app.post("/api/v1/devices/{device_id}/toggle", dependencies=[Depends(_require_admin_session)])
 async def toggle_device(device_id: str, db: SessionLocal = Depends(get_db)):
     device = db.query(Device).filter(Device.device_id == device_id).first()
     if not device:
@@ -393,7 +455,7 @@ async def upload_audio(
         wav_path.unlink(missing_ok=True)
 
 
-@app.get("/api/v1/conversations")
+@app.get("/api/v1/conversations", dependencies=[Depends(_require_admin_session)])
 async def list_conversations(limit: int = 50, device_id: Optional[str] = None, db: SessionLocal = Depends(get_db)):
     query = db.query(Conversation)
     if device_id:
@@ -415,10 +477,10 @@ async def list_conversations(limit: int = 50, device_id: Optional[str] = None, d
 
 @app.get("/api/v1/health")
 async def health():
-    return {"status": "ok", "ollama_model": OLLAMA_MODEL, "whisper_model": WHISPER_MODEL, "version": "1.1.0"}
+    return {"status": "ok", "ollama_model": OLLAMA_MODEL, "whisper_model": WHISPER_MODEL, "version": "1.2.0"}
 
 
-@app.get("/dashboard", response_class=HTMLResponse)
+@app.get("/dashboard", response_class=HTMLResponse, dependencies=[Depends(_require_admin_session)])
 async def dashboard():
     dashboard_path = Path(__file__).parent / "static" / "dashboard.html"
     if dashboard_path.exists():
