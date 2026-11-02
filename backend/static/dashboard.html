@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bee Backend Dashboard</title>
+  <style>
+    :root { --bg:#0f172a; --card:#1e293b; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --danger:#f87171; --ok:#34d399; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
+    header { padding: 1.5rem; border-bottom: 1px solid #334155; display: flex; align-items: center; justify-content: space-between; }
+    header h1 { margin: 0; font-size: 1.25rem; }
+    .container { max-width: 1100px; margin: 0 auto; padding: 1.5rem; }
+    .card { background: var(--card); border-radius: 0.75rem; padding: 1.25rem; margin-bottom: 1rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+    label { display: block; margin: 0.75rem 0 0.25rem; color: var(--muted); font-size: 0.875rem; }
+    input, textarea, button { font: inherit; padding: 0.5rem 0.75rem; border-radius: 0.375rem; border: 1px solid #475569; background: #0f172a; color: var(--text); width: 100%; }
+    button { background: var(--accent); color: #0f172a; border: none; cursor: pointer; font-weight: 600; }
+    button:hover { opacity: 0.9; }
+    button.secondary { background: #334155; color: var(--text); }
+    .token { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0f172a; padding: 0.5rem; border-radius: 0.375rem; word-break: break-all; border: 1px dashed var(--accent); }
+    .muted { color: var(--muted); }
+    .status { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
+    .status.enabled { background: rgba(52,211,153,0.15); color: var(--ok); }
+    .status.disabled { background: rgba(248,113,113,0.15); color: var(--danger); }
+    table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+    th, td { text-align: left; padding: 0.6rem; border-bottom: 1px solid #334155; }
+    th { color: var(--muted); font-weight: 500; }
+    .actions { display: flex; gap: 0.5rem; }
+    .actions button { width: auto; font-size: 0.75rem; padding: 0.3rem 0.6rem; }
+    .toast { position: fixed; bottom: 1rem; right: 1rem; background: var(--card); border: 1px solid var(--accent); padding: 0.75rem 1rem; border-radius: 0.5rem; display: none; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🐝 Bee Backend Dashboard</h1>
+    <span class="muted" id="health">Checking health…</span>
+  </header>
+  <div class="container">
+    <div class="grid">
+      <div class="card">
+        <h2>Onboard new device</h2>
+        <label for="deviceId">Device ID</label>
+        <input id="deviceId" placeholder="e.g. bee-pocket-02">
+        <label for="deviceName">Friendly name (optional)</label>
+        <input id="deviceName" placeholder="e.g. Ajay's pocket unit">
+        <label for="adminToken">Admin token</label>
+        <input id="adminToken" type="password" placeholder="BEE_ADMIN_TOKEN value">
+        <button id="onboardBtn" style="margin-top:0.75rem">Generate API key</button>
+        <div id="onboardResult" style="margin-top:1rem; display:none;">
+          <p class="muted">API key (shown once):</p>
+          <div class="token" id="apiKey"></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Stats</h2>
+        <p class="muted">Total devices: <strong id="deviceCount">–</strong></p>
+        <p class="muted">Conversations: <strong id="convCount">–</strong></p>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Devices</h2>
+      <table>
+        <thead>
+          <tr><th>Device</th><th>Name</th><th>Status</th><th>Last seen</th><th>Created</th><th>Actions</th></tr>
+        </thead>
+        <tbody id="deviceTable"><tr><td class="muted" colspan="6">Loading…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>Recent conversations</h2>
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Device</th><th>Summary</th><th>To-dos</th></tr>
+        </thead>
+        <tbody id="convTable"><tr><td class="muted" colspan="4">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const toast = (msg, type='info') => {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.style.display = 'block';
+      el.style.borderColor = type === 'error' ? 'var(--danger)' : 'var(--accent)';
+      setTimeout(() => el.style.display = 'none', 4000);
+    };
+
+    async function getAdminToken() {
+      let token = document.getElementById('adminToken').value.trim();
+      if (!token) token = localStorage.getItem('beeAdminToken') || '';
+      if (!token) throw new Error('Admin token required');
+      localStorage.setItem('beeAdminToken', token);
+      document.getElementById('adminToken').value = token;
+      return token;
+    }
+
+    async function api(path, opts={}) {
+      const token = await getAdminToken();
+      const res = await fetch(path, {
+        headers: { 'Authorization': token, 'Accept': 'application/json', ...(opts.headers||{}) },
+        ...opts
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`${res.status}: ${text}`);
+      }
+      return res.json();
+    }
+
+    async function loadHealth() {
+      try {
+        const h = await fetch('/api/v1/health').then(r => r.json());
+        document.getElementById('health').textContent = `Healthy • ${h.whisper_model} • ${h.ollama_model}`;
+      } catch (e) {
+        document.getElementById('health').textContent = 'Health check failed';
+      }
+    }
+
+    async function loadDevices() {
+      try {
+        const devices = await api('/api/v1/devices');
+        document.getElementById('deviceCount').textContent = devices.length;
+        const tbody = document.getElementById('deviceTable');
+        tbody.innerHTML = devices.map(d => `
+          <tr>
+            <td>${d.device_id}</td>
+            <td>${d.name || '–'}</td>
+            <td><span class="status ${d.enabled ? 'enabled' : 'disabled'}">${d.enabled ? 'Enabled' : 'Disabled'}</span></td>
+            <td class="muted">${d.last_seen_at ? new Date(d.last_seen_at).toLocaleString() : 'Never'}</td>
+            <td class="muted">${new Date(d.created_at).toLocaleString()}</td>
+            <td class="actions">
+              <button class="secondary" onclick="rotateKey('${d.device_id}')">Rotate key</button>
+              <button class="secondary" onclick="toggleDevice('${d.device_id}')">${d.enabled ? 'Disable' : 'Enable'}</button>
+            </td>
+          </tr>
+        `).join('') || '<tr><td class="muted" colspan="6">No devices yet</td></tr>';
+      } catch (e) { toast(e.message, 'error'); }
+    }
+
+    async function loadConversations() {
+      try {
+        const conv = await fetch('/api/v1/conversations?limit=20').then(r => r.json());
+        document.getElementById('convCount').textContent = conv.length + '+';
+        const tbody = document.getElementById('convTable');
+        tbody.innerHTML = conv.map(c => `
+          <tr>
+            <td class="muted">${new Date(c.created_at).toLocaleString()}</td>
+            <td>${c.device_id}</td>
+            <td>${c.summary || c.transcript.slice(0, 80) + (c.transcript.length > 80 ? '…' : '')}</td>
+            <td class="muted">${(c.todos || []).join(', ') || '–'}</td>
+          </tr>
+        `).join('') || '<tr><td class="muted" colspan="4">No conversations yet</td></tr>';
+      } catch (e) { toast(e.message, 'error'); }
+    }
+
+    document.getElementById('onboardBtn').addEventListener('click', async () => {
+      const deviceId = document.getElementById('deviceId').value.trim();
+      if (!deviceId) return toast('Device ID required', 'error');
+      try {
+        const result = await api('/api/v1/onboard', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ device_id: deviceId, name: document.getElementById('deviceName').value.trim() })
+        });
+        document.getElementById('apiKey').textContent = result.api_key;
+        document.getElementById('onboardResult').style.display = 'block';
+        toast('Device onboarded. Copy the API key now — it will not be shown again.');
+        await loadDevices();
+      } catch (e) { toast(e.message, 'error'); }
+    });
+
+    window.rotateKey = async (deviceId) => {
+      if (!confirm(`Rotate API key for ${deviceId}? The old key will stop working immediately.`)) return;
+      try {
+        const result = await api(`/api/v1/devices/${deviceId}/rotate`, { method: 'POST' });
+        prompt(`New API key for ${deviceId}:`, result.api_key);
+        await loadDevices();
+      } catch (e) { toast(e.message, 'error'); }
+    };
+
+    window.toggleDevice = async (deviceId) => {
+      try {
+        await api(`/api/v1/devices/${deviceId}/toggle`, { method: 'POST' });
+        await loadDevices();
+      } catch (e) { toast(e.message, 'error'); }
+    };
+
+    (async () => {
+      await loadHealth();
+      await loadDevices();
+      await loadConversations();
+    })();
+  </script>
+</body>
+</html>

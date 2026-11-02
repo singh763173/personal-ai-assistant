@@ -207,6 +207,8 @@ log_step "Writing environment configuration..."
 cat > "$PROJECT_DIR/.env" <<EOF
 BEE_BACKEND_URL=$BACKEND_URL
 BEE_DEVICE_ID=$DEVICE_ID
+# Get your API key from the backend dashboard, then update this line:
+# BEE_API_KEY=bee_xxxxxxxxxxxxxxxxxxxxxxxx
 BEE_CHUNK_SECONDS=30
 BEE_SAMPLE_RATE=16000
 BEE_AUDIO_CHANNELS=2

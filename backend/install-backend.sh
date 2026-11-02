@@ -9,14 +9,16 @@
 #   - Installs Ollama if not already installed
 #   - Creates the backend project directory
 #   - Installs Python dependencies including faster-whisper
-#   - Configures the backend to use kimi-k2.7-code:cloud via Ollama
+#   - Configures the backend with API key auth and dashboard
 #   - Creates and enables the bee-backend systemd service
-#   - Prints clear instructions for authorizing Ollama.com cloud models
+#   - Installs cloudflared if tunnel token is provided
 #
 # Environment variables (all optional):
 #   OLLAMA_MODEL      - default: kimi-k2.7-code:cloud
 #   WHISPER_MODEL     - default: base
 #   OLLAMA_URL        - default: http://localhost:11434
+#   BEE_ADMIN_TOKEN   - admin token for device onboarding/dashboard
+#   CLOUDFLARE_TUNNEL_TOKEN - optional, creates cloudflared service if set
 #   BEE_GITHUB_REPO   - default: https://github.com/singh763173/personal-ai-assistant
 #
 set -euo pipefail
@@ -25,6 +27,8 @@ BACKEND_DIR="${BACKEND_DIR:-/opt/bee-backend}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-kimi-k2.7-code:cloud}"
 WHISPER_MODEL="${WHISPER_MODEL:-base}"
+BEE_ADMIN_TOKEN="${BEE_ADMIN_TOKEN:-}"
+CLOUDFLARE_TUNNEL_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-}"
 GITHUB_REPO="${BEE_GITHUB_REPO:-https://github.com/singh763173/personal-ai-assistant}"
 
 RED='\033[0;31m'
@@ -43,10 +47,16 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+if [[ -z "$BEE_ADMIN_TOKEN" ]]; then
+    log_warn "No BEE_ADMIN_TOKEN set. Device onboarding and dashboard will be inaccessible."
+    log_warn "Generate one now with: openssl rand -hex 32"
+fi
+
 log_info "Personal AI Assistant backend installer"
 log_info "Backend directory: $BACKEND_DIR"
 log_info "Ollama URL:        $OLLAMA_URL"
 log_info "Ollama model:      $OLLAMA_MODEL"
+log_info "Tunnel token set:  $([[ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]] && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
 # 1. Update system
@@ -116,13 +126,17 @@ pip install -r "$BACKEND_DIR/requirements.txt"
 # 5. Configure environment file
 # ---------------------------------------------------------------------------
 log_step "Writing backend environment configuration..."
+HEALTH_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo '127.0.0.1')"
 cat > "$BACKEND_DIR/.env" <<EOF
 OLLAMA_URL=$OLLAMA_URL
 OLLAMA_MODEL=$OLLAMA_MODEL
 WHISPER_MODEL=$WHISPER_MODEL
 WHISPER_DEVICE=cpu
 WHISPER_COMPUTE_TYPE=int8
+BEE_ADMIN_TOKEN=$BEE_ADMIN_TOKEN
 EOF
+
+chown -R bee-backend:bee-backend "$BACKEND_DIR" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 6. Create systemd service
@@ -130,9 +144,6 @@ EOF
 log_step "Creating bee-backend systemd service..."
 useradd -r -s /bin/false bee-backend 2>/dev/null || log_warn "bee-backend user already exists"
 chown -R bee-backend:bee-backend "$BACKEND_DIR"
-
-# Use a reliable LAN IP for the final health hint.
-HEALTH_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'YOUR_BACKEND_IP')"
 
 cat > /etc/systemd/system/bee-backend.service <<EOF
 [Unit]
@@ -157,41 +168,53 @@ systemctl daemon-reload
 systemctl enable bee-backend.service
 
 # ---------------------------------------------------------------------------
-# 7. Print cloud authorization instructions
+# 7. Optional cloudflared tunnel
 # ---------------------------------------------------------------------------
-cat <<EOF
+if [[ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]]; then
+    log_step "Installing cloudflared..."
+    if ! command -v cloudflared &> /dev/null; then
+        curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+        dpkg -i /tmp/cloudflared.deb || apt-get install -f -y
+        rm -f /tmp/cloudflared.deb
+    fi
 
-$(log_warn "ACTION REQUIRED: Authorize Ollama Cloud Access")
+    cat > /etc/systemd/system/cloudflared-bee-backend.service <<EOF
+[Unit]
+Description=Cloudflare Tunnel for Bee Backend
+After=network.target
 
-This backend uses the cloud-hosted model: ${YELLOW}$OLLAMA_MODEL${NC}
+[Service]
+Type=simple
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token $CLOUDFLARE_TUNNEL_TOKEN
+Restart=always
+RestartSec=10
+User=root
 
-Before it can work, you must:
-
-1. Open a browser and go to: ${BLUE}https://ollama.com${NC}
-2. Sign in or create an account.
-3. Go to your account/API keys page.
-4. Generate an API key.
-5. Add the API key to Ollama on this machine by running:
-
-   ${YELLOW}ollama login${NC}
-
-   Then paste your API key when prompted.
-
-6. Verify the cloud model is available:
-
-   ${YELLOW}ollama list${NC}
-
-   You should see "$OLLAMA_MODEL" in the list.
-
-7. Start the backend service:
-
-   ${YELLOW}sudo systemctl start bee-backend${NC}
-
-8. Test the backend health endpoint:
-
-   ${YELLOW}curl http://$HEALTH_IP:8000/health${NC}
-
+[Install]
+WantedBy=multi-user.target
 EOF
 
-log_info "Backend setup is complete. Ollama is installed but cloud authorization is still required."
-log_info "Rebooting is not required, but may be useful for clean startup of all services."
+    systemctl daemon-reload
+    systemctl enable --now cloudflared-bee-backend.service
+    log_info "cloudflared service started."
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Start backend and print instructions
+# ---------------------------------------------------------------------------
+log_step "Starting backend service..."
+systemctl start bee-backend.service || log_warn "Backend service failed to start; check logs with: journalctl -u bee-backend -n 50"
+
+sleep 2
+
+log_info "Backend setup complete."
+echo ""
+echo -e "${YELLOW}Admin token:${NC} ${BEE_ADMIN_TOKEN:-not set}"
+echo -e "${YELLOW}Local health check:${NC} curl http://$HEALTH_IP:8000/api/v1/health"
+echo -e "${YELLOW}Dashboard:${NC} http://$HEALTH_IP:8000/dashboard"
+if [[ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]]; then
+    echo -e "${YELLOW}Tunnel:${NC} cloudflared should connect shortly. Check with: systemctl status cloudflared-bee-backend"
+fi
+echo ""
+log_warn "ACTION REQUIRED: Authorize Ollama Cloud Access"
+log_warn "Run 'ollama login' and paste your ollama.com API key if using model: $OLLAMA_MODEL"
