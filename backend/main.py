@@ -25,6 +25,26 @@ from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 app = FastAPI(title="Ollama Bee Backend")
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    from fastapi.responses import JSONResponse, HTMLResponse
+    if request.headers.get("accept", "").startswith("application/json"):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+    # For browser requests return a simple HTML page
+    return HTMLResponse(
+        status_code=exc.status_code,
+        content=f"""<!DOCTYPE html>
+<html><head><title>{exc.status_code}</title></head>
+<body style="font-family:system-ui; background:#0f172a; color:#e2e8f0; padding:2rem;">
+<h1>{exc.status_code}</h1>
+<p>{exc.detail}</p>
+</body></html>""",
+        headers=exc.headers,
+    )
+
+
 security = HTTPBearer(auto_error=False)
 
 # Config
@@ -128,6 +148,19 @@ def _extract_token(request: Request, credentials: Optional[HTTPAuthorizationCred
     return ""
 
 
+async def _verify_admin_from_request(request: Request):
+    """Middleware-style dependency that requires admin token for browser/API access."""
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Admin token not configured")
+    token = _extract_token(request, None)
+    if token != ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required. Provide the admin token in the Authorization header.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
 def _require_admin(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     if not ADMIN_TOKEN:
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Admin token not configured")
@@ -214,6 +247,47 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     return response
+
+
+@app.middleware("http")
+async def admin_gate(request: Request, call_next):
+    """Require admin token for all browser-facing and admin endpoints.
+
+    Publicly accessible:
+      - /api/v1/health       (uptime probe)
+      - /api/v1/upload       (wearable devices via API key)
+    Everything else is gated.
+    """
+    from fastapi.responses import JSONResponse, HTMLResponse
+
+    path = request.url.path
+    public_paths = {"/api/v1/health", "/api/v1/upload"}
+    if path in public_paths:
+        return await call_next(request)
+
+    if not ADMIN_TOKEN:
+        detail = "Admin token not configured"
+        status_code = status.HTTP_501_NOT_IMPLEMENTED
+    else:
+        token = _extract_token(request, None)
+        if token == ADMIN_TOKEN:
+            return await call_next(request)
+        detail = "Authentication required. Provide the admin token in the Authorization header."
+        status_code = status.HTTP_401_UNAUTHORIZED
+
+    headers = {"WWW-Authenticate": "Bearer"}
+    if request.headers.get("accept", "").startswith("application/json"):
+        return JSONResponse(status_code=status_code, content={"detail": detail}, headers=headers)
+    return HTMLResponse(
+        status_code=status_code,
+        content=f"""<!DOCTYPE html>
+<html><head><title>{status_code}</title></head>
+<body style="font-family:system-ui; background:#0f172a; color:#e2e8f0; padding:2rem;">
+<h1>{status_code}</h1>
+<p>{detail}</p>
+</body></html>""",
+        headers=headers,
+    )
 
 
 @app.post("/api/v1/onboard", response_model=OnboardResponse, dependencies=[Depends(_require_admin)])
