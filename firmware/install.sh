@@ -33,7 +33,9 @@ PROJECT_DIR="/opt/bee-device"
 SERVICE_USER="bee-device"
 BACKEND_URL="${BEE_BACKEND_URL:-http://192.168.1.86:8000}"
 DEVICE_ID="${BEE_DEVICE_ID:-bee-pioneer-01}"
+API_KEY="${BEE_API_KEY:-}"
 GITHUB_REPO="${BEE_GITHUB_REPO:-https://github.com/singh763173/personal-ai-assistant}"
+SKIP_UPDATE="${BEE_SKIP_UPDATE:-0}"
 
 # The PiSugar Whisplay unified driver exposes the ALSA card 'whisplaysound'.
 AUDIO_CARD="whisplaysound"
@@ -70,9 +72,13 @@ log_info "Source repo:   $GITHUB_REPO"
 # ---------------------------------------------------------------------------
 # 1. Update system
 # ---------------------------------------------------------------------------
-log_step "Updating system packages..."
-apt update
-apt full-upgrade -y
+if [[ "$SKIP_UPDATE" != "1" ]]; then
+  log_step "Updating system packages..."
+  apt update
+  apt full-upgrade -y
+else
+  log_info "Skipping system update (BEE_SKIP_UPDATE=1)"
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Install system dependencies
@@ -207,8 +213,7 @@ log_step "Writing environment configuration..."
 cat > "$PROJECT_DIR/.env" <<EOF
 BEE_BACKEND_URL=$BACKEND_URL
 BEE_DEVICE_ID=$DEVICE_ID
-# Get your API key from the backend dashboard, then update this line:
-# BEE_API_KEY=bee_xxxxxxxxxxxxxxxxxxxxxxxx
+BEE_API_KEY=${API_KEY}
 BEE_CHUNK_SECONDS=30
 BEE_SAMPLE_RATE=16000
 BEE_AUDIO_CHANNELS=2
