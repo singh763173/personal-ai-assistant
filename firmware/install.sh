@@ -207,8 +207,8 @@ usermod -aG gpio,i2c,spi,audio,video,input "$SERVICE_USER" 2>/dev/null || true
 log_step "Creating Python virtual environment..."
 python3 -m venv "$PROJECT_DIR/venv"
 source "$PROJECT_DIR/venv/bin/activate"
-pip install --upgrade pip
-pip install -r "$PROJECT_DIR/requirements.txt"
+pip install flask --upgrade pip
+pip install flask -r "$PROJECT_DIR/requirements.txt"
 
 # ---------------------------------------------------------------------------
 # 10. Configure environment file

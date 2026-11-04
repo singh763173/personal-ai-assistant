@@ -19,6 +19,15 @@ from pathlib import Path
 
 import requests
 
+# Wi-Fi management
+try:
+    from wifi_manager import create_manager
+
+    HAS_WIFI_MANAGER = True
+except Exception as e:
+    print(f"wifi_manager import failed: {e}")
+    HAS_WIFI_MANAGER = False
+
 # Optional hardware libraries
 try:
     from picamera2 import Picamera2
@@ -547,7 +556,9 @@ class BeeDeviceWhisplay:
             count = self._click_count
             self._click_count = 0
 
-        if count >= 2:
+        if count >= 3:
+            self._on_triple_click()
+        elif count >= 2:
             self._on_double_click()
         elif count == 1:
             self._on_single_click()
@@ -556,6 +567,23 @@ class BeeDeviceWhisplay:
         if self.state != "DASHBOARD":
             return
         self._enter_listening()
+
+    def _on_triple_click(self):
+        if not HAS_WIFI_MANAGER:
+            print("WiFi manager not available")
+            return
+        print("Triple click: entering WiFi setup mode")
+        self._set_state("WIFI_SETUP")
+        self.gif.stop()
+        self._set_rgb(0, 0, 255)
+        with contextlib.suppress(Exception):
+            if self.board:
+                self.board.cleanup()
+        try:
+            self.wifi_manager = create_manager()
+            self.wifi_manager.enter_setup_mode()
+        except Exception as e:
+            print(f"Failed to start setup mode: {e}")
 
     def _on_double_click(self):
         if self.state not in {"DASHBOARD", "LISTENING"}:
@@ -577,7 +605,7 @@ class BeeDeviceWhisplay:
 
     def run(self):
         print(f"Bee device {DEVICE_ID} starting. Backend: {BACKEND_URL}")
-        print("Single click = voice, Double click = photo+voice, Long press = shutdown")
+        print("Single click = voice, Double click = photo+voice, Triple click = WiFi setup, Long press = shutdown")
         self._enter_dashboard()
         try:
             while True:
