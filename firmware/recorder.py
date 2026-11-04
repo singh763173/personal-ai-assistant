@@ -463,8 +463,11 @@ class BeeDeviceWhisplay:
             mp3_path.parent.mkdir(exist_ok=True)
             with open(mp3_path, "wb") as f:
                 f.write(r.content)
-            # mpg123 handles mp3 and outputs via ALSA default card
-            player = ["mpg123", "-q", str(mp3_path)]
+            # ffplay handles mp3 via default ALSA card
+            player = [
+                "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                str(mp3_path),
+            ]
             subprocess.run(player, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             print(f"[AUDIO] Played reply")
         except Exception as e:
