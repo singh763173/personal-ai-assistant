@@ -68,6 +68,7 @@ class _DashboardCache:
                 self.durations.append(max(source.info.get("duration", 100), 20) / 1000.0)
         self.font_clock = _font("JetBrainsMono-Bold.ttf", 44)
         self.font_label = _font("NotoSans-Bold.ttf", 11)
+        self.font_label_med = _font("NotoSans-Bold.ttf", 13)
         self.font_tiny = _font("NotoSans-Regular.ttf", 9)
 
 
@@ -168,7 +169,7 @@ def live_dashboard_frame(
         backend_online: Whether the backend was reachable recently.
         status_text: Optional short message shown at the bottom.
     """
-    gif = Path(animation_file) if animation_file else HERE / "dashboard_background.gif"
+    gif = Path(animation_file) if animation_file else HERE / "dashboard_background_clean.gif"
     _cache.load(gif)
 
     image = _cache.frames[frame_index % len(_cache.frames)].copy()
@@ -178,6 +179,9 @@ def live_dashboard_frame(
     # ---- Top status bar ----
     # Backend online dot (left)
     _draw_backend_dot(d, 10, 11, backend_online)
+    status_label = "READY" if backend_online else "OFFLINE"
+    status_colour = CYAN if backend_online else MUTED
+    d.text((22, 11), status_label, font=_cache.font_tiny, fill=status_colour)
 
     # Wi-Fi bars (centre)
     _draw_wifi_bars(d, WIDTH // 2 - 12, 12, wifi_rssi, wifi_connected)
@@ -200,10 +204,28 @@ def live_dashboard_frame(
     _text_with_shadow(d, (16, 34), now.strftime("%H:%M"), _cache.font_clock, WHITE)
     _text_with_shadow(d, (18, 90), now.strftime("%a %d %b").upper(), _cache.font_label, MUTED)
 
-    # ---- Optional status line at the bottom ----
-    # Drawn above the dashboard's own bottom pill area (which starts ~210 px)
+    # ---- Bottom action pill ----
+    pill_y = 242
+    pill_height = 26
+    pill_x1, pill_x2 = 16, WIDTH - 16
+    d.rounded_rectangle(
+        (pill_x1, pill_y, pill_x2, pill_y + pill_height),
+        radius=pill_height // 2,
+        outline=CYAN,
+        width=2,
+    )
+    _text_with_shadow(
+        d,
+        (WIDTH // 2, pill_y + pill_height // 2 + 1),
+        "TAP TO TALK  •  DOUBLE TAP PHOTO",
+        _cache.font_tiny,
+        WHITE,
+        anchor="mm",
+    )
+
+    # ---- Optional status line above the pill ----
     if status_text:
-        _text_with_shadow(d, (WIDTH // 2, 232), status_text, _cache.font_tiny, MUTED, anchor="mm")
+        _text_with_shadow(d, (WIDTH // 2, 228), status_text, _cache.font_tiny, MUTED, anchor="mm")
 
     assert image.size == (WIDTH, HEIGHT)
     return image

@@ -82,7 +82,7 @@ MAX_RECORD_SECONDS = float(os.getenv("BEE_MAX_RECORD_SECONDS", "15.0"))
 CAMERA_MAX_SECONDS = float(os.getenv("BEE_CAMERA_MAX_SECONDS", "10.0"))
 
 # GIF assets
-GIF_DASHBOARD = ASSETS_DIR / "dashboard_background.gif"
+GIF_DASHBOARD = ASSETS_DIR / "dashboard_background_clean.gif"
 GIF_LISTENING = ASSETS_DIR / "listening.gif"
 GIF_CAMERA_VOICE = ASSETS_DIR / "camera_voice.gif"
 GIF_PROCESSING = ASSETS_DIR / "processing.gif"
