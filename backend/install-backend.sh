@@ -26,6 +26,7 @@ set -euo pipefail
 BACKEND_DIR="${BACKEND_DIR:-/opt/bee-backend}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-kimi-k2.7-code:cloud}"
+OLLAMA_VISION_MODEL="${OLLAMA_VISION_MODEL:-moondream:latest}"
 WHISPER_MODEL="${WHISPER_MODEL:-base}"
 BEE_ADMIN_TOKEN="${BEE_ADMIN_TOKEN:-}"
 CLOUDFLARE_TUNNEL_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-}"
@@ -56,6 +57,7 @@ log_info "Personal AI Assistant backend installer"
 log_info "Backend directory: $BACKEND_DIR"
 log_info "Ollama URL:        $OLLAMA_URL"
 log_info "Ollama model:      $OLLAMA_MODEL"
+log_info "Ollama vision:     $OLLAMA_VISION_MODEL"
 log_info "Tunnel token set:  $([[ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]] && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------

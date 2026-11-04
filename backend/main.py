@@ -53,7 +53,7 @@ security = HTTPBearer(auto_error=False)
 # Config
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "kimi-k2.7-code:cloud")
-OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava:7b")
+OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "moondream:latest")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
@@ -367,8 +367,8 @@ async def admin_gate(request: Request, call_next):
     Everything else requires an authenticated session.
     """
     path = request.url.path
-    public_paths = {"/api/v1/health", "/api/v1/upload", "/api/v1/ask", "/login", "/api/v1/login"}
-    if path in public_paths:
+    public_paths = {"/api/v1/health", "/api/v1/upload", "/api/v1/ask", "/api/v1/audio", "/login", "/api/v1/login"}
+    if any(path == p or path.startswith(p + "/") for p in public_paths):
         return await call_next(request)
     if path.startswith("/static/"):
         pass
