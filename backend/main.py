@@ -57,6 +57,8 @@ OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "moondream:latest")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+WHISPER_URL = os.getenv("WHISPER_URL", "")  # e.g. http://192.168.1.86:8001/transcribe
+WHISPER_LOCAL = not WHISPER_URL
 
 ADMIN_USERNAME = os.getenv("BEE_ADMIN_USERNAME", "")
 ADMIN_PASSWORD_HASH = os.getenv("BEE_ADMIN_PASSWORD_HASH", "")
@@ -228,8 +230,21 @@ def _rate_limit(request: Request, device: Device = Depends(_require_device)):
 
 
 def transcribe(path: Path) -> str:
-    segments, _ = whisper_model.transcribe(str(path), language="en", beam_size=5)
-    return " ".join([seg.text.strip() for seg in segments]).strip()
+    if WHISPER_LOCAL:
+        segments, _ = whisper_model.transcribe(str(path), language="en", beam_size=1)
+        return " ".join([seg.text.strip() for seg in segments]).strip()
+
+    # Remote Whisper service on the LAN
+    try:
+        with open(path, "rb") as f:
+            files = {"audio": (path.name, f, "audio/wav")}
+            resp = requests.post(WHISPER_URL, files=files, timeout=30)
+            resp.raise_for_status()
+            return resp.json().get("transcript", "")
+    except Exception as e:
+        print(f"Remote Whisper failed: {e}; falling back to local")
+        segments, _ = whisper_model.transcribe(str(path), language="en", beam_size=1)
+        return " ".join([seg.text.strip() for seg in segments]).strip()
 
 
 def ask_ollama(transcript: str) -> dict:
