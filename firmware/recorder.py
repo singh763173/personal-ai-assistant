@@ -351,6 +351,34 @@ class BeeDeviceWhisplay:
             self.last_upload_ok = False
             return False
 
+    def _upload_ask_with_image(self, img_path: Path, wav_path: Path):
+        url = f"{BACKEND_URL}/api/v1/ask"
+        try:
+            with open(wav_path, "rb") as f_wav, open(img_path, "rb") as f_img:
+                files = {
+                    "audio": (wav_path.name, f_wav, "audio/wav"),
+                    "image": (img_path.name, f_img, "image/jpeg"),
+                }
+                data = {"device_id": DEVICE_ID}
+                headers = {"Authorization": API_KEY} if API_KEY else {}
+                resp = self.session.post(url, files=files, data=data, headers=headers, timeout=180)
+                resp.raise_for_status()
+                result = resp.json()
+                reply = result.get("reply", "")
+                audio_url = result.get("audio_url")
+                print(f"[LLM+vision] reply: {reply}")
+                self.last_upload_ok = True
+                if reply:
+                    self._show_reply(reply)
+                    self._play_reply_audio(audio_url)
+                return True
+        except Exception as e:
+            print(f"Vision ask failed: {e}")
+            self.last_upload_ok = False
+            return False
+        finally:
+            self._update_display()
+
     def _upload_last_recording(self):
         wav_path = self._stop_recording()
         if wav_path and wav_path.exists():
@@ -365,6 +393,29 @@ class BeeDeviceWhisplay:
         if img_path:
             self.last_camera_ok = self._upload_file("/api/v1/upload-image", "image", img_path)
             self._cleanup(img_path)
+
+    def _upload_file(self, url_path: str, field: str, file_path: Path) -> bool:
+        url = f"{BACKEND_URL}{url_path}"
+        try:
+            with open(file_path, "rb") as f:
+                files = {field: (file_path.name, f, "image/jpeg" if field == "image" else "audio/wav")}
+                data = {"device_id": DEVICE_ID}
+                headers = {"Authorization": API_KEY} if API_KEY else {}
+                resp = self.session.post(url, files=files, data=data, headers=headers, timeout=180)
+                resp.raise_for_status()
+                result = resp.json()
+                reply = result.get("reply", "")
+                audio_url = result.get("audio_url")
+                print(f"[UPLOAD {field}] reply: {reply}")
+                self.last_upload_ok = True
+                if reply:
+                    self._show_reply(reply)
+                    self._play_reply_audio(audio_url)
+                return True
+        except Exception as e:
+            print(f"Upload {field} failed: {e}")
+            self.last_upload_ok = False
+            return False
 
     def _show_reply(self, text: str):
         if not self.board or not HAS_PIL:
@@ -412,8 +463,8 @@ class BeeDeviceWhisplay:
             mp3_path.parent.mkdir(exist_ok=True)
             with open(mp3_path, "wb") as f:
                 f.write(r.content)
-            # Play via aplay if available, otherwise ffplay
-            player = ["aplay", "-D", f"hw:{AUDIO_CARD}", str(mp3_path)]
+            # mpg123 handles mp3 and outputs via ALSA default card
+            player = ["mpg123", "-q", str(mp3_path)]
             subprocess.run(player, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             print(f"[AUDIO] Played reply")
         except Exception as e:

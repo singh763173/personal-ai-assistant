@@ -643,6 +643,58 @@ async def list_conversations(limit: int = 50, device_id: Optional[str] = None, d
     ]
 
 
+@app.post("/api/v1/upload-image", response_model=AskResponse)
+async def upload_image(
+    request: Request,
+    image: UploadFile = File(...),
+    device_id: str = Form("unknown"),
+    device: Device = Depends(_rate_limit),
+):
+    """Vision-only endpoint: describe what the camera sees and reply with spoken audio."""
+    tmp_dir = Path("/tmp/bee-uploads")
+    tmp_dir.mkdir(exist_ok=True)
+    suffix = Path(image.filename).suffix or ".jpg"
+    img_path = tmp_dir / f"{_now().isoformat()}-{image.filename}"
+
+    body = await image.read()
+    if len(body) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Max upload size is {MAX_UPLOAD_BYTES} bytes")
+
+    with open(img_path, "wb") as f:
+        f.write(body)
+
+    transcript = "[image]"
+    try:
+        reply = ask_ollama_vision(transcript, img_path)
+    except Exception as e:
+        reply = f"Sorry, I couldn't analyze the image right now. Error: {e}"
+
+    db = next(get_db())
+    conv = Conversation(
+        device_id=device_id,
+        transcript=transcript,
+        summary="",
+        reply=reply,
+        todos=json.dumps([]),
+        raw_llm_response="",
+        image_path=str(img_path),
+    )
+    db.add(conv)
+    db.commit()
+    db.refresh(conv)
+
+    # Generate TTS audio
+    audio_rel_path = await _generate_tts(conv.id, reply)
+
+    return AskResponse(
+        conversation_id=conv.id,
+        transcript=transcript,
+        summary="",
+        reply=reply,
+        todos=[],
+        audio_url=audio_rel_path,
+    )
+
 @app.get("/api/v1/health")
 async def health():
     return {"status": "ok", "ollama_model": OLLAMA_MODEL, "whisper_model": WHISPER_MODEL, "version": "1.2.0"}
