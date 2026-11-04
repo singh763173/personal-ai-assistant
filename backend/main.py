@@ -111,9 +111,13 @@ class Device(Base):
 Base.metadata.create_all(bind=engine)
 
 # Load models
-print(f"Loading Whisper model: {WHISPER_MODEL} ({WHISPER_DEVICE}/{WHISPER_COMPUTE})...")
-whisper_model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE)
-print("Whisper loaded.")
+if WHISPER_LOCAL:
+    print(f"Loading Whisper model: {WHISPER_MODEL} ({WHISPER_DEVICE}/{WHISPER_COMPUTE})...")
+    whisper_model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE)
+    print("Whisper loaded.")
+else:
+    print(f"Using remote Whisper service at {WHISPER_URL}")
+    whisper_model = None
 
 
 class UploadResponse(BaseModel):
