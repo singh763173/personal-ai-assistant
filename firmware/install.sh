@@ -230,6 +230,24 @@ EOF
 chown -R "$SERVICE_USER:$SERVICE_USER" "$PROJECT_DIR"
 
 # ---------------------------------------------------------------------------
+# 10b. Add system Python packages to venv and copy Whisplay runtime
+# ---------------------------------------------------------------------------
+log_step "Adding system Python packages to venv..."
+VENV_SITE="$PROJECT_DIR/venv/lib/python3.13/site-packages"
+printf '/usr/local/lib/python3.13/dist-packages\n/usr/lib/python3/dist-packages\n/usr/lib/python3.13/dist-packages\n' > "$VENV_SITE/system-site-packages.pth"
+WHISPLAY_RUNTIME=""
+if [[ -d /tmp/Whisplay/runtime ]]; then
+    WHISPLAY_RUNTIME=/tmp/Whisplay/runtime
+elif [[ -d /home/ajay/Whisplay/runtime ]]; then
+    WHISPLAY_RUNTIME=/home/ajay/Whisplay/runtime
+fi
+if [[ -f "$WHISPLAY_RUNTIME/whisplay.py" ]]; then
+    cp "$WHISPLAY_RUNTIME/whisplay.py" "$VENV_SITE/whisplay.py"
+    cp "$WHISPLAY_RUNTIME/pillow_compat.py" "$VENV_SITE/pillow_compat.py" 2>/dev/null || true
+    chown "$SERVICE_USER:$SERVICE_USER" "$VENV_SITE/whisplay.py" "$VENV_SITE/pillow_compat.py" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
 # 11. Create systemd service
 # ---------------------------------------------------------------------------
 log_step "Creating bee-device systemd service..."
