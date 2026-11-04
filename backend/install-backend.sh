@@ -14,13 +14,15 @@
 #   - Installs cloudflared if tunnel token is provided
 #
 # Environment variables (all optional):
-#   OLLAMA_MODEL      - default: kimi-k2.7-code:cloud
-#   WHISPER_MODEL     - default: base
-#   WHISPER_URL       - default: http://192.168.1.86:8001/transcribe (LAN-only AIServer01)
-#   OLLAMA_URL        - default: http://localhost:11434
-#   BEE_ADMIN_TOKEN   - admin token for device onboarding/dashboard
+#   OLLAMA_MODEL          - default: kimi-k2.7-code:cloud
+#   WHISPER_MODEL         - default: base
+#   WHISPER_URL           - default: http://192.168.1.86:8001/transcribe (LAN-only AIServer01)
+#   WHISPER_API_KEY       - shared secret with the LAN Whisper service (default: empty)
+#   OLLAMA_URL            - default: http://localhost:11434
+#   BEE_ADMIN_USERNAME    - dashboard username (default: admin)
+#   BEE_ADMIN_PASSWORD    - dashboard password (prompted if not set)
 #   CLOUDFLARE_TUNNEL_TOKEN - optional, creates cloudflared service if set
-#   BEE_GITHUB_REPO   - default: https://github.com/singh763173/personal-ai-assistant
+#   BEE_GITHUB_REPO       - default: https://github.com/singh763173/personal-ai-assistant
 #
 set -euo pipefail
 
@@ -29,8 +31,10 @@ OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-kimi-k2.7-code:cloud}"
 OLLAMA_VISION_MODEL="${OLLAMA_VISION_MODEL:-moondream:latest}"
 WHISPER_URL="${WHISPER_URL:-http://192.168.1.86:8001/transcribe}"
+WHISPER_API_KEY="${WHISPER_API_KEY:-}"
 WHISPER_MODEL="${WHISPER_MODEL:-base}"
-BEE_ADMIN_TOKEN="${BEE_ADMIN_TOKEN:-}"
+BEE_ADMIN_USERNAME="${BEE_ADMIN_USERNAME:-admin}"
+BEE_ADMIN_PASSWORD="${BEE_ADMIN_PASSWORD:-}"
 CLOUDFLARE_TUNNEL_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-}"
 GITHUB_REPO="${BEE_GITHUB_REPO:-https://github.com/singh763173/personal-ai-assistant}"
 
@@ -50,9 +54,14 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-if [[ -z "$BEE_ADMIN_TOKEN" ]]; then
-    log_warn "No BEE_ADMIN_TOKEN set. Device onboarding and dashboard will be inaccessible."
-    log_warn "Generate one now with: openssl rand -hex 32"
+if [[ -z "$BEE_ADMIN_PASSWORD" ]]; then
+    log_warn "No BEE_ADMIN_PASSWORD set."
+    read -rsp "Enter dashboard password for user '$BEE_ADMIN_USERNAME': " BEE_ADMIN_PASSWORD
+    echo
+fi
+if [[ -z "$BEE_ADMIN_PASSWORD" ]]; then
+    log_error "Dashboard password is required. Set BEE_ADMIN_PASSWORD and re-run."
+    exit 1
 fi
 
 log_info "Personal AI Assistant backend installer"
@@ -60,6 +69,7 @@ log_info "Backend directory: $BACKEND_DIR"
 log_info "Ollama URL:        $OLLAMA_URL"
 log_info "Ollama model:      $OLLAMA_MODEL"
 log_info "Ollama vision:     $OLLAMA_VISION_MODEL"
+log_info "Whisper URL:       $WHISPER_URL"
 log_info "Tunnel token set:  $([[ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]] && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
@@ -136,10 +146,13 @@ OLLAMA_URL=$OLLAMA_URL
 OLLAMA_MODEL=$OLLAMA_MODEL
 OLLAMA_VISION_MODEL=$OLLAMA_VISION_MODEL
 WHISPER_URL=${WHISPER_URL:-http://192.168.1.86:8001/transcribe}
+WHISPER_API_KEY=$WHISPER_API_KEY
 WHISPER_MODEL=$WHISPER_MODEL
 WHISPER_DEVICE=cpu
 WHISPER_COMPUTE_TYPE=int8
-BEE_ADMIN_TOKEN=$BEE_ADMIN_TOKEN
+BEE_ADMIN_USERNAME=$BEE_ADMIN_USERNAME
+BEE_ADMIN_PASSWORD_HASH=$(python3 -c "import bcrypt, sys; print(bcrypt.hashpw(sys.argv[1].encode(), bcrypt.gensalt(rounds=12)).decode())" "$BEE_ADMIN_PASSWORD")
+BEE_SECRET_KEY=$(openssl rand -hex 32)
 EOF
 
 chown -R bee-backend:bee-backend "$BACKEND_DIR" 2>/dev/null || true
@@ -155,7 +168,6 @@ cat > /etc/systemd/system/bee-backend.service <<EOF
 [Unit]
 Description=Personal AI Assistant Backend
 After=network.target ollama.service
-Requires=ollama.service
 
 [Service]
 Type=simple
@@ -215,12 +227,11 @@ sleep 2
 
 log_info "Backend setup complete."
 echo ""
-echo -e "${YELLOW}Admin token:${NC} ${BEE_ADMIN_TOKEN:-not set}"
+echo -e "${YELLOW}Admin username:${NC} ${BEE_ADMIN_USERNAME}"
 echo -e "${YELLOW}Local health check:${NC} curl http://$HEALTH_IP:8000/api/v1/health"
 echo -e "${YELLOW}Dashboard:${NC} http://$HEALTH_IP:8000/dashboard"
 if [[ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]]; then
     echo -e "${YELLOW}Tunnel:${NC} cloudflared should connect shortly. Check with: systemctl status cloudflared-bee-backend"
 fi
 echo ""
-log_warn "ACTION REQUIRED: Authorize Ollama Cloud Access"
-log_warn "Run 'ollama login' and paste your ollama.com API key if using model: $OLLAMA_MODEL"
+log_info "Setup complete."

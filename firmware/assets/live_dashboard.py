@@ -18,10 +18,45 @@ from PIL import Image, ImageDraw, ImageFont
 WIDTH, HEIGHT = 240, 280
 HERE = Path(__file__).resolve().parent
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-FONT_NORMAL = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 WHITE = (237, 242, 255)
 MUTED = (138, 146, 177)
 CYAN = (110, 242, 254)
+
+
+class _DashboardCache:
+    """Avoid reloading the GIF and fonts on every frame."""
+
+    def __init__(self):
+        self.gif_path: Path | None = None
+        self.frames: list[Image.Image] | None = None
+        self.durations: list[float] | None = None
+        self.font_big: ImageFont.FreeTypeFont | None = None
+        self.font_small: ImageFont.FreeTypeFont | None = None
+        self.font_tiny: ImageFont.FreeTypeFont | None = None
+
+    def load(self, gif: Path) -> None:
+        if self.gif_path == gif and self.frames is not None:
+            return
+        self.gif_path = gif
+        with Image.open(gif) as source:
+            self.frames = []
+            self.durations = []
+            for i in range(source.n_frames):
+                source.seek(i)
+                self.frames.append(source.convert("RGB").copy())
+                self.durations.append(max(source.info.get("duration", 100), 20) / 1000.0)
+        try:
+            self.font_big = ImageFont.truetype(FONT_PATH, 46)
+            self.font_small = ImageFont.truetype(FONT_PATH, 10)
+            self.font_tiny = ImageFont.truetype(FONT_PATH, 9)
+        except OSError:
+            # Fallback to default bitmap font if DejaVu is missing
+            self.font_big = ImageFont.load_default()
+            self.font_small = self.font_big
+            self.font_tiny = self.font_big
+
+
+_cache = _DashboardCache()
 
 
 def live_dashboard_frame(
@@ -36,21 +71,17 @@ def live_dashboard_frame(
     percentage from your own PiSugar model / configured battery service.
     """
     gif = Path(animation_file) if animation_file else HERE / "dashboard_background.gif"
-    with Image.open(gif) as source:
-        source.seek(frame_index % source.n_frames)
-        image = source.convert("RGB")
+    _cache.load(gif)
 
+    image = _cache.frames[frame_index % len(_cache.frames)].copy()
     d = ImageDraw.Draw(image)
     now = now or datetime.now()
-    big = ImageFont.truetype(FONT_PATH, 46)
-    small = ImageFont.truetype(FONT_PATH, 10)
-    tiny = ImageFont.truetype(FONT_PATH, 9)
 
-    d.text((16, 36), now.strftime("%H:%M"), fill=WHITE, font=big)
-    d.text((18, 92), now.strftime("%a %d %b").upper(), fill=MUTED, font=small)
+    d.text((16, 36), now.strftime("%H:%M"), fill=WHITE, font=_cache.font_big)
+    d.text((18, 92), now.strftime("%a %d %b").upper(), fill=MUTED, font=_cache.font_small)
 
     battery = max(0, min(100, int(battery_percent)))
-    d.text((183, 12), f"{battery}%", fill=WHITE, font=tiny)
+    d.text((183, 12), f"{battery}%", fill=WHITE, font=_cache.font_tiny)
     d.rounded_rectangle((216, 13, 231, 23), radius=2, outline=MUTED, width=1)
     d.rounded_rectangle((231, 16, 233, 20), radius=1, fill=MUTED)
     d.rounded_rectangle((218, 15, 218 + 2 + round(battery / 100 * 10), 21),

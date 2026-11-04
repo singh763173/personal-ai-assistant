@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Ollama Bee Device firmware v3.0 — animated Whisplay UI
+Ollama Bee Device firmware v3.1 — animated Whisplay UI
 
 States:
   DASHBOARD -> LISTENING -> PROCESSING -> SPEAKING -> RETURN_HOME -> DASHBOARD
   DASHBOARD -> CAMERA_VOICE -> PROCESSING -> SPEAKING -> RETURN_HOME -> DASHBOARD
 """
 import os
+import sys
 import time
 import subprocess
 import threading
@@ -27,7 +28,7 @@ except Exception as e:
     HAS_CAMERA = False
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image
     HAS_PIL = True
 except Exception as e:
     print(f"PIL import failed: {e}")
@@ -42,22 +43,18 @@ except Exception as e:
 
 # Load live dashboard helper
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
-sys_path_inserted = False
+sys.path.insert(0, str(ASSETS_DIR))
 try:
-    import sys
-    sys.path.insert(0, str(ASSETS_DIR))
-    sys_path_inserted = True
     from live_dashboard import live_dashboard_frame
     HAS_LIVE_DASHBOARD = True
 except Exception as e:
     print(f"live_dashboard import failed: {e}")
     HAS_LIVE_DASHBOARD = False
 finally:
-    if sys_path_inserted:
-        sys.path.pop(0)
+    sys.path.pop(0)
 
 # Config from env
-BACKEND_URL = os.getenv("BEE_BACKEND_URL", "http://192.168.1.86:8000")
+BACKEND_URL = os.getenv("BEE_BACKEND_URL", "http://192.168.1.86:8000").rstrip("/")
 DEVICE_ID = os.getenv("BEE_DEVICE_ID", "bee-pioneer-01")
 API_KEY = os.getenv("BEE_API_KEY", "")
 SAMPLE_RATE = int(os.getenv("BEE_SAMPLE_RATE", "16000"))
@@ -69,6 +66,7 @@ PISUGAR_API = os.getenv("BEE_PISUGAR_API", "http://localhost:8423")
 
 SILENCE_TIMEOUT_SECONDS = float(os.getenv("BEE_SILENCE_TIMEOUT", "3.0"))
 MAX_RECORD_SECONDS = float(os.getenv("BEE_MAX_RECORD_SECONDS", "15.0"))
+CAMERA_MAX_SECONDS = float(os.getenv("BEE_CAMERA_MAX_SECONDS", "10.0"))
 
 # GIF assets
 GIF_DASHBOARD = ASSETS_DIR / "dashboard_background.gif"
@@ -76,6 +74,10 @@ GIF_LISTENING = ASSETS_DIR / "listening.gif"
 GIF_CAMERA_VOICE = ASSETS_DIR / "camera_voice.gif"
 GIF_PROCESSING = ASSETS_DIR / "processing.gif"
 GIF_RETURN_HOME = ASSETS_DIR / "return_home.gif"
+
+# Constants
+LCD_WIDTH, LCD_HEIGHT = 240, 280
+IMAGE_UPLOAD_WIDTH = 640
 
 
 def rgb565_bytes(img: Image.Image) -> bytes:
@@ -100,33 +102,37 @@ class GifPlayer:
         self._thread = None
         self._current_file = None
         self._frame_index = 0
+        self._cache = {}
+
+    def _load_gif(self, gif_path: Path):
+        if gif_path in self._cache:
+            return self._cache[gif_path]
+        frames = []
+        durations = []
+        with Image.open(gif_path) as gif:
+            for i in range(gif.n_frames):
+                gif.seek(i)
+                frames.append(gif.convert("RGB").copy())
+                durations.append(max(gif.info.get("duration", 100), 20) / 1000.0)
+        self._cache[gif_path] = (frames, durations)
+        return frames, durations
 
     def _play_loop(self, gif_path: Path, loop: bool = True, overlay_func=None):
         try:
-            with Image.open(gif_path) as gif:
-                frames = []
-                durations = []
-                for i in range(gif.n_frames):
-                    gif.seek(i)
-                    frames.append(gif.convert("RGB").copy())
-                    # Duration in seconds; default 100ms
-                    durations.append(max(gif.info.get("duration", 100), 20) / 1000.0)
-
-                while not self._stop_event.is_set():
-                    for idx, frame in enumerate(frames):
-                        if self._stop_event.is_set():
-                            return
-                        img = overlay_func(frame, idx) if overlay_func else frame
-                        self.draw_func(img)
-                        self._frame_index = idx
-                        # Wait duration, but allow early stop
-                        if self._stop_event.wait(durations[idx]):
-                            return
-                    if not loop:
-                        # For one-shot GIFs, stay on the final frame
-                        final = overlay_func(frames[-1], len(frames) - 1) if overlay_func else frames[-1]
-                        self.draw_func(final)
+            frames, durations = self._load_gif(gif_path)
+            while not self._stop_event.is_set():
+                for idx, frame in enumerate(frames):
+                    if self._stop_event.is_set():
                         return
+                    img = overlay_func(frame, idx) if overlay_func else frame
+                    self.draw_func(img)
+                    self._frame_index = idx
+                    if self._stop_event.wait(durations[idx]):
+                        return
+                if not loop:
+                    final = overlay_func(frames[-1], len(frames) - 1) if overlay_func else frames[-1]
+                    self.draw_func(final)
+                    return
         except Exception as e:
             print(f"GIF playback error: {e}")
 
@@ -159,8 +165,8 @@ class BeeDeviceWhisplay:
     }
 
     def __init__(self):
-        self.state = "DASHBOARD"
-        self.lock = threading.Lock()
+        self._state = "DASHBOARD"
+        self._state_lock = threading.Lock()
         self.session = requests.Session()
 
         self.board = None
@@ -181,6 +187,18 @@ class BeeDeviceWhisplay:
 
         self._init_whisplay()
         self._init_camera()
+
+    @property
+    def state(self) -> str:
+        with self._state_lock:
+            return self._state
+
+    def _set_state(self, new_state: str):
+        if new_state not in self.STATES:
+            raise ValueError(f"Unknown state {new_state}")
+        with self._state_lock:
+            self._state = new_state
+        print(f"[{datetime.now(timezone.utc).isoformat()}] State -> {new_state}")
 
     def _init_whisplay(self):
         if not HAS_WHISPLAY:
@@ -214,7 +232,7 @@ class BeeDeviceWhisplay:
     def _draw_image(self, img: Image.Image):
         if self.board and HAS_PIL:
             try:
-                self.board.draw_image(0, 0, 240, 280, rgb565_bytes(img))
+                self.board.draw_image(0, 0, LCD_WIDTH, LCD_HEIGHT, rgb565_bytes(img))
             except Exception as e:
                 print(f"LCD draw failed: {e}")
 
@@ -231,7 +249,6 @@ class BeeDeviceWhisplay:
         if not HAS_LIVE_DASHBOARD:
             return frame
         try:
-            # live_dashboard_frame re-opens the GIF; pass the same file and frame index
             battery = self._get_battery() or 0
             return live_dashboard_frame(
                 battery_percent=battery,
@@ -242,12 +259,7 @@ class BeeDeviceWhisplay:
             print(f"Dashboard overlay failed: {e}")
             return frame
 
-    def _set_state(self, new_state: str):
-        with self.lock:
-            if new_state not in self.STATES:
-                raise ValueError(f"Unknown state {new_state}")
-            self.state = new_state
-        print(f"[{datetime.now(timezone.utc).isoformat()}] State -> {new_state}")
+    # ---- State transitions ----
 
     def _enter_dashboard(self):
         self._set_state("DASHBOARD")
@@ -259,7 +271,6 @@ class BeeDeviceWhisplay:
         self.gif.play(GIF_LISTENING, loop=True)
         self._set_rgb(0, 255, 0)
         self._start_recording()
-        # Start a thread to stop recording on silence timeout or max duration
         threading.Thread(target=self._listen_then_process, daemon=True).start()
 
     def _enter_camera_voice(self):
@@ -275,14 +286,12 @@ class BeeDeviceWhisplay:
 
     def _enter_speaking(self, reply_text: str, audio_url: str):
         self._set_state("SPEAKING")
-        self.gif.stop()
-        # Keep last dashboard/processing frame briefly, then play audio
+        self.gif.play(GIF_PROCESSING, loop=True)
         threading.Thread(target=self._speak_reply, args=(reply_text, audio_url), daemon=True).start()
 
     def _enter_return_home(self):
         self._set_state("RETURN_HOME")
         self.gif.play(GIF_RETURN_HOME, loop=False)
-        # Wait for one-shot GIF to finish roughly, then go dashboard
         threading.Thread(target=self._return_home_then_dashboard, daemon=True).start()
 
     def _set_rgb(self, *color):
@@ -339,17 +348,7 @@ class BeeDeviceWhisplay:
         print(f"[REC] Stop -> {wav_path}")
         return wav_path
 
-    def _wav_duration_seconds(self, wav_path: Path) -> float:
-        try:
-            with wave.open(str(wav_path), "rb") as w:
-                frames = w.getnframes()
-                rate = w.getframerate()
-                return frames / float(rate) if rate else 0.0
-        except Exception:
-            return 0.0
-
     def _wait_for_silence(self, wav_path: Path, timeout: float, silence_seconds: float):
-        """Monitor the recording file; stop when it stops growing for silence_seconds."""
         start = time.monotonic()
         last_size = 0
         silent_since = None
@@ -374,9 +373,10 @@ class BeeDeviceWhisplay:
         wav_path = self._recorder_path
         if not wav_path:
             return
-        # Wait for speech to finish
-        self._wait_for_silence(wav_path, MAX_RECORD_SECONDS, SILENCE_TIMEOUT_SECONDS)
-        wav_path = self._stop_recording()
+        try:
+            self._wait_for_silence(wav_path, MAX_RECORD_SECONDS, SILENCE_TIMEOUT_SECONDS)
+        finally:
+            wav_path = self._stop_recording()
         self._enter_processing()
         self._upload_ask("/api/v1/ask", wav_path)
         self._cleanup(wav_path)
@@ -386,14 +386,24 @@ class BeeDeviceWhisplay:
         if not img_path:
             self._enter_dashboard()
             return
-        # Continue showing camera_voice while recording the question
-        wav_path = self._start_recording()
-        self._wait_for_silence(wav_path, 8.0, SILENCE_TIMEOUT_SECONDS)
-        wav_path = self._stop_recording()
-        self._enter_processing()
-        self._upload_ask_with_image(img_path, wav_path)
-        self._cleanup(wav_path)
-        self._cleanup(img_path)
+        try:
+            wav_path = self._start_recording()
+            # Wait for button release or max duration
+            release_event = threading.Event()
+            def wait_release():
+                # The button release callback will set _recording_stop_event when detected
+                while self.state == "CAMERA_VOICE" and not self._recording_stop_event.is_set():
+                    time.sleep(0.05)
+                release_event.set()
+            threading.Thread(target=wait_release, daemon=True).start()
+            release_event.wait(timeout=CAMERA_MAX_SECONDS)
+            wav_path = self._stop_recording()
+            self._enter_processing()
+            self._upload_ask_with_image(img_path, wav_path)
+        finally:
+            self._cleanup(img_path)
+            if self._recorder_path:
+                self._stop_recording()
 
     def _capture_image(self) -> Path:
         if not self.camera:
@@ -401,10 +411,16 @@ class BeeDeviceWhisplay:
         tmp_dir = Path(tempfile.gettempdir()) / "bee-device"
         tmp_dir.mkdir(exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+        raw_path = tmp_dir / f"{DEVICE_ID}-{stamp}-raw.jpg"
         img_path = tmp_dir / f"{DEVICE_ID}-{stamp}.jpg"
         try:
-            self.camera.capture_file(str(img_path))
-            print(f"Captured -> {img_path}")
+            self.camera.capture_file(str(raw_path))
+            # Downscale for faster upload
+            with Image.open(raw_path) as img:
+                img.thumbnail((IMAGE_UPLOAD_WIDTH, IMAGE_UPLOAD_WIDTH), Image.Resampling.LANCZOS)
+                img.save(img_path, "JPEG", quality=85)
+            raw_path.unlink(missing_ok=True)
+            print(f"Captured -> {img_path} ({img_path.stat().st_size} bytes)")
             return img_path
         except Exception as e:
             print(f"Camera capture failed: {e}")
@@ -454,27 +470,30 @@ class BeeDeviceWhisplay:
             return False
 
     def _speak_reply(self, reply_text: str, audio_url: str):
-        if not audio_url or not reply_text:
+        if not reply_text:
             self._enter_return_home()
             return
         try:
-            url = f"{BACKEND_URL}{audio_url}"
-            r = self.session.get(url, timeout=30)
-            r.raise_for_status()
-            mp3_path = Path(tempfile.gettempdir()) / "bee-device" / "reply.mp3"
-            mp3_path.parent.mkdir(exist_ok=True)
-            with open(mp3_path, "wb") as f:
-                f.write(r.content)
-            player = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(mp3_path)]
-            subprocess.run(player, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            print("[AUDIO] Played reply")
+            if audio_url:
+                url = f"{BACKEND_URL}{audio_url}"
+                r = self.session.get(url, timeout=30)
+                r.raise_for_status()
+                mp3_path = Path(tempfile.gettempdir()) / "bee-device" / "reply.mp3"
+                mp3_path.parent.mkdir(exist_ok=True)
+                with open(mp3_path, "wb") as f:
+                    f.write(r.content)
+                player = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(mp3_path)]
+                subprocess.run(player, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                print("[AUDIO] Played reply")
+            else:
+                print("[AUDIO] No audio URL; reply text only")
         except Exception as e:
             print(f"Audio play failed: {e}")
         finally:
             self._enter_return_home()
 
     def _return_home_then_dashboard(self):
-        # Wait for the one-shot GIF to finish (approx 2s); then back to dashboard
+        # Wait for the one-shot GIF to finish roughly, then back to dashboard
         time.sleep(2.5)
         self._enter_dashboard()
 
@@ -499,6 +518,10 @@ class BeeDeviceWhisplay:
                 self._on_long_press()
             return
 
+        # If in camera voice mode, signal recording to stop on release
+        if self.state == "CAMERA_VOICE":
+            self._recording_stop_event.set()
+
         with self._click_lock:
             self._click_count += 1
             count = self._click_count
@@ -517,17 +540,13 @@ class BeeDeviceWhisplay:
             self._on_single_click()
 
     def _on_single_click(self):
-        # Only act from dashboard
-        with self.lock:
-            if self.state != "DASHBOARD":
-                return
+        if self.state != "DASHBOARD":
+            return
         self._enter_listening()
 
     def _on_double_click(self):
-        with self.lock:
-            if self.state not in {"DASHBOARD", "LISTENING"}:
-                return
-        # If we were already listening, stop that and do camera+voice
+        if self.state not in {"DASHBOARD", "LISTENING"}:
+            return
         if self.state == "LISTENING":
             self._recording_stop_event.set()
             self._stop_recording()
@@ -551,12 +570,7 @@ class BeeDeviceWhisplay:
         self._enter_dashboard()
         try:
             while True:
-                # Keep the dashboard clock/battery updating; the GIF loop handles frames,
-                # but the overlay refreshes itself when called per frame.
                 time.sleep(1)
-                if self.state == "DASHBOARD":
-                    # Force an immediate frame refresh so clock updates within a second
-                    pass
         except KeyboardInterrupt:
             print("Shutting down...")
         finally:

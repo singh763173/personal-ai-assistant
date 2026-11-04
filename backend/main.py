@@ -58,6 +58,7 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 WHISPER_URL = os.getenv("WHISPER_URL", "")  # e.g. http://192.168.1.86:8001/transcribe
+WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "")
 WHISPER_LOCAL = not WHISPER_URL
 
 ADMIN_USERNAME = os.getenv("BEE_ADMIN_USERNAME", "")
@@ -151,6 +152,11 @@ def _hash_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
 
+def _safe_device_id(device_id: str) -> str:
+    """Sanitize a device id for use in filenames."""
+    return "".join(c for c in device_id if c.isalnum() or c in "-_").rstrip()[:64] or "unknown"
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -233,8 +239,18 @@ def _rate_limit(request: Request, device: Device = Depends(_require_device)):
     return device
 
 
+def _load_local_whisper():
+    global whisper_model
+    if whisper_model is not None:
+        return
+    print(f"Loading Whisper model: {WHISPER_MODEL} ({WHISPER_DEVICE}/{WHISPER_COMPUTE})...")
+    whisper_model = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE)
+    print("Whisper loaded.")
+
+
 def transcribe(path: Path) -> str:
     if WHISPER_LOCAL:
+        _load_local_whisper()
         segments, _ = whisper_model.transcribe(str(path), language="en", beam_size=1)
         return " ".join([seg.text.strip() for seg in segments]).strip()
 
@@ -242,12 +258,15 @@ def transcribe(path: Path) -> str:
     try:
         with open(path, "rb") as f:
             files = {"audio": (path.name, f, "audio/wav")}
-            resp = requests.post(WHISPER_URL, files=files, timeout=30)
+            headers = {"Authorization": WHISPER_API_KEY} if WHISPER_API_KEY else {}
+            resp = requests.post(WHISPER_URL, files=files, headers=headers, timeout=30)
             resp.raise_for_status()
             return resp.json().get("transcript", "")
     except Exception as e:
         print(f"Remote Whisper failed: {e}; falling back to local")
+        _load_local_whisper()
         segments, _ = whisper_model.transcribe(str(path), language="en", beam_size=1)
+        return " ".join([seg.text.strip() for seg in segments]).strip()
         return " ".join([seg.text.strip() for seg in segments]).strip()
 
 
@@ -402,9 +421,8 @@ async def admin_gate(request: Request, call_next):
     public_paths = {"/api/v1/health", "/api/v1/upload", "/api/v1/upload-image", "/api/v1/ask", "/api/v1/audio", "/login", "/api/v1/login"}
     if any(path == p or path.startswith(p + "/") for p in public_paths):
         return await call_next(request)
-    if path.startswith("/static/"):
-        pass
 
+    # Static assets are only served after authentication below.
     user = _get_session_user(request)
     if user != ADMIN_USERNAME:
         if request.headers.get("accept", "").startswith("application/json"):
@@ -431,18 +449,19 @@ async def login_page():
 
 
 @app.post("/api/v1/login")
-async def login(username: str = Form(...), password: str = Form(...)):
+async def login(request: Request, username: str = Form(...), password: str = Form(...)):
     if not ADMIN_USERNAME or not ADMIN_PASSWORD_HASH:
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Admin credentials not configured")
     if username != ADMIN_USERNAME or not _verify_password(password, ADMIN_PASSWORD_HASH):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
+        return RedirectResponse(url="/login?error=Invalid+username+or+password", status_code=302)
     token = _create_session_token(username)
     response = RedirectResponse(url="/dashboard", status_code=302)
+    secure_cookie = request.url.scheme == "https"
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
         value=token,
         httponly=True,
-        secure=True,
+        secure=secure_cookie,
         samesite="lax",
         max_age=SESSION_MAX_AGE_HOURS * 3600,
     )
@@ -526,16 +545,16 @@ async def upload_audio(
 
     tmp_dir = Path("/tmp/bee-uploads")
     tmp_dir.mkdir(exist_ok=True)
-    wav_path = tmp_dir / f"{_now().isoformat()}-{audio.filename}"
+    wav_path = tmp_dir / f"{_now().strftime('%Y%m%d-%H%M%S-%f')}-{_safe_device_id(device_id)}-{audio.filename}"
 
     with open(wav_path, "wb") as f:
         f.write(body)
 
+    db = next(get_db())
     try:
         transcript = transcribe(wav_path)
         llm_result = ask_ollama(transcript)
 
-        db = next(get_db())
         conv = Conversation(
             device_id=device_id,
             transcript=transcript,
@@ -546,7 +565,6 @@ async def upload_audio(
         db.add(conv)
         db.commit()
         db.refresh(conv)
-        db.close()
 
         return UploadResponse(
             conversation_id=conv.id,
@@ -555,6 +573,7 @@ async def upload_audio(
             todos=llm_result["todos"],
         )
     finally:
+        db.close()
         wav_path.unlink(missing_ok=True)
 
 
@@ -576,7 +595,7 @@ async def ask_endpoint(
 
     tmp_dir = Path("/tmp/bee-uploads")
     tmp_dir.mkdir(exist_ok=True)
-    wav_path = tmp_dir / f"{_now().isoformat()}-{audio.filename}"
+    wav_path = tmp_dir / f"{_now().strftime('%Y%m%d-%H%M%S-%f')}-{_safe_device_id(device_id)}-{audio.filename}"
     image_path = None
     image_b64 = None
 
@@ -591,7 +610,7 @@ async def ask_endpoint(
             img_body = await image.read()
             if len(img_body) > MAX_UPLOAD_BYTES:
                 raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Max image size is {MAX_UPLOAD_BYTES} bytes")
-            image_path = tmp_dir / f"{_now().isoformat()}-{image.filename}"
+            image_path = tmp_dir / f"{_now().strftime('%Y%m%d-%H%M%S-%f')}-{_safe_device_id(device_id)}-{image.filename}"
             with open(image_path, "wb") as f:
                 f.write(img_body)
             image_b64 = base64.b64encode(img_body).decode("utf-8")
@@ -610,37 +629,39 @@ async def ask_endpoint(
         tts_ok = await text_to_speech(reply, mp3_path)
 
         db = next(get_db())
-        conv = Conversation(
-            device_id=device_id,
-            transcript=transcript,
-            summary="",
-            reply=reply,
-            todos=json.dumps([]),
-            raw_llm_response=reply,
-            image_path=str(image_path) if image_path else None,
-        )
-        db.add(conv)
-        db.commit()
-        db.refresh(conv)
-        db.close()
+        try:
+            conv = Conversation(
+                device_id=device_id,
+                transcript=transcript,
+                summary="",
+                reply=reply,
+                todos=json.dumps([]),
+                raw_llm_response=reply,
+                image_path=str(image_path) if image_path else None,
+            )
+            db.add(conv)
+            db.commit()
+            db.refresh(conv)
 
-        # Rename MP3 to use conversation id for easy serving
-        final_mp3_path = audio_dir / f"{conv.id}.mp3"
-        if tts_ok:
-            mp3_path.rename(final_mp3_path)
-        else:
-            final_mp3_path = None
+            # Rename MP3 to use conversation id for easy serving
+            final_mp3_path = audio_dir / f"{conv.id}.mp3"
+            if tts_ok:
+                mp3_path.rename(final_mp3_path)
+            else:
+                final_mp3_path = None
 
-        audio_url = f"/api/v1/audio/{conv.id}.mp3" if final_mp3_path and final_mp3_path.exists() else None
+            audio_url = f"/api/v1/audio/{conv.id}.mp3" if final_mp3_path and final_mp3_path.exists() else None
 
-        return UploadResponse(
-            conversation_id=conv.id,
-            transcript=transcript,
-            summary="",
-            reply=reply,
-            todos=[],
-            audio_url=audio_url,
-        )
+            return UploadResponse(
+                conversation_id=conv.id,
+                transcript=transcript,
+                summary="",
+                reply=reply,
+                todos=[],
+                audio_url=audio_url,
+            )
+        finally:
+            db.close()
     finally:
         wav_path.unlink(missing_ok=True)
 
@@ -686,7 +707,7 @@ async def upload_image(
     tmp_dir = Path("/tmp/bee-uploads")
     tmp_dir.mkdir(exist_ok=True)
     suffix = Path(image.filename).suffix or ".jpg"
-    img_path = tmp_dir / f"{_now().isoformat()}-{image.filename}"
+    img_path = tmp_dir / f"{_now().strftime('%Y%m%d-%H%M%S-%f')}-{_safe_device_id(device_id)}-{image.filename}"
 
     body = await image.read()
     if len(body) > MAX_UPLOAD_BYTES:
@@ -703,30 +724,33 @@ async def upload_image(
         reply = f"Sorry, I couldn't analyze the image right now. Error: {e}"
 
     db = next(get_db())
-    conv = Conversation(
-        device_id=device_id,
-        transcript=transcript,
-        summary="",
-        reply=reply,
-        todos=json.dumps([]),
-        raw_llm_response="",
-        image_path=str(img_path),
-    )
-    db.add(conv)
-    db.commit()
-    db.refresh(conv)
+    try:
+        conv = Conversation(
+            device_id=device_id,
+            transcript=transcript,
+            summary="",
+            reply=reply,
+            todos=json.dumps([]),
+            raw_llm_response="",
+            image_path=str(img_path),
+        )
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
 
-    # Generate TTS audio
-    audio_rel_path = await _generate_tts(conv.id, reply)
+        # Generate TTS audio
+        audio_rel_path = await _generate_tts(conv.id, reply)
 
-    return UploadResponse(
-        conversation_id=conv.id,
-        transcript=transcript,
-        summary="",
-        reply=reply,
-        todos=[],
-        audio_url=audio_rel_path,
-    )
+        return UploadResponse(
+            conversation_id=conv.id,
+            transcript=transcript,
+            summary="",
+            reply=reply,
+            todos=[],
+            audio_url=audio_rel_path,
+        )
+    finally:
+        db.close()
 
 @app.get("/api/v1/health")
 async def health():

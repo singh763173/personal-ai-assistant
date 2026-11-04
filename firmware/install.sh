@@ -234,8 +234,8 @@ chown -R "$SERVICE_USER:$SERVICE_USER" "$PROJECT_DIR"
 # 10b. Add system Python packages to venv and copy Whisplay runtime
 # ---------------------------------------------------------------------------
 log_step "Adding system Python packages to venv..."
-VENV_SITE="$PROJECT_DIR/venv/lib/python3.13/site-packages"
-printf '/usr/local/lib/python3.13/dist-packages\n/usr/lib/python3/dist-packages\n/usr/lib/python3.13/dist-packages\n' > "$VENV_SITE/system-site-packages.pth"
+VENV_SITE="$PROJECT_DIR/venv/lib/python$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')/site-packages"
+printf '/usr/local/lib/python3/dist-packages\n/usr/lib/python3/dist-packages\n/usr/lib/python3%s/dist-packages\n' "$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" > "$VENV_SITE/system-site-packages.pth"
 WHISPLAY_RUNTIME=""
 if [[ -d /tmp/Whisplay/runtime ]]; then
     WHISPLAY_RUNTIME=/tmp/Whisplay/runtime
