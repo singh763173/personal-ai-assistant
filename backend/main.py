@@ -12,8 +12,6 @@ import base64
 import hashlib
 import json
 import os
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 import secrets
 import time
 from datetime import UTC, datetime, timedelta
@@ -411,15 +409,22 @@ async def text_to_speech(text: str, out_path: Path) -> bool:
     try:
         if TTS_PROVIDER == "piper":
             import io
-            import wave
+            import os
             import subprocess as sp
+            import wave
+
             from piper import PiperVoice
 
+            # Constrain ONNX threads before loading the session
+            os.environ.setdefault("OMP_NUM_THREADS", "1")
+            os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
             voice = PiperVoice.load(PIPER_VOICE_MODEL)
-            # Limit Piper/ONNX logging
+            # Suppress verbose ONNX logs
             import onnxruntime as ort
+
             ort.set_default_logger_severity(3)
             from piper.voice import SynthesisConfig
+
             syn_config = SynthesisConfig(
                 length_scale=1.0,
                 noise_scale=0.667,
