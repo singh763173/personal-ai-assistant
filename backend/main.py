@@ -920,7 +920,18 @@ async def cleanup_middleware(request: Request, call_next):
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
-@app.get("/api/v1/metrics", dependencies=[Depends(_require_admin_session)])
+async def _require_admin_or_device(
+    request: Request,
+    user: str | None = Depends(_require_admin_session),
+    device: Device | None = Depends(_require_device),
+):
+    """Allow either a logged-in admin or an authenticated device to view metrics."""
+    if user or device:
+        return user or device
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Login required")
+
+
+@app.get("/api/v1/metrics", dependencies=[Depends(_require_admin_or_device)])
 async def metrics(db: SessionLocal = Depends(get_db)):
     """Basic operational metrics for the backend."""
     conv_count = db.query(Conversation).count()

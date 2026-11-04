@@ -266,7 +266,10 @@ class BeeDeviceWhisplay:
     def _check_backend_online(self, timeout: float = 5.0) -> bool:
         """Return True if the configured backend is reachable."""
         try:
-            r = requests.get(f"{BACKEND_URL}/api/v1/metrics", timeout=timeout)
+            headers = {}
+            if API_KEY:
+                headers["Authorization"] = API_KEY
+            r = requests.get(f"{BACKEND_URL}/api/v1/metrics", headers=headers, timeout=timeout)
             return r.status_code == 200
         except Exception:
             return False
