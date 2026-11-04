@@ -57,7 +57,7 @@ except Exception as e:
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 sys.path.insert(0, str(ASSETS_DIR))
 try:
-    from live_dashboard import live_dashboard_frame
+    from live_dashboard import current_wifi_rssi, current_wifi_ssid, live_dashboard_frame
 
     HAS_LIVE_DASHBOARD = True
 except Exception as e:
@@ -263,15 +263,28 @@ class BeeDeviceWhisplay:
         except Exception:
             return None
 
+    def _check_backend_online(self, timeout: float = 5.0) -> bool:
+        """Return True if the configured backend is reachable."""
+        try:
+            r = requests.get(f"{BACKEND_URL}/api/v1/metrics", timeout=timeout)
+            return r.status_code == 200
+        except Exception:
+            return False
+
     def _dashboard_overlay(self, frame: Image.Image, frame_index: int) -> Image.Image:
         if not HAS_LIVE_DASHBOARD:
             return frame
         try:
             battery = self._get_battery() or 0
+            ssid = current_wifi_ssid()
+            rssi = current_wifi_rssi() if ssid else None
             return live_dashboard_frame(
                 battery_percent=battery,
                 frame_index=frame_index,
                 animation_file=GIF_DASHBOARD,
+                wifi_connected=ssid is not None,
+                wifi_rssi=rssi,
+                backend_online=self._check_backend_online(),
             )
         except Exception as e:
             print(f"Dashboard overlay failed: {e}")
