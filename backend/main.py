@@ -416,12 +416,16 @@ async def text_to_speech(text: str, out_path: Path) -> bool:
             from piper import PiperVoice
 
             voice = PiperVoice.load(PIPER_VOICE_MODEL)
-            # Limit Piper/ONNX threads to avoid LXC affinity warnings
+            # Limit Piper/ONNX logging
             import onnxruntime as ort
             ort.set_default_logger_severity(3)
-            syn_config = voice.config
-            syn_config.num_threads = 1
-            syn_config.length_scale = 1.0
+            from piper.voice import SynthesisConfig
+            syn_config = SynthesisConfig(
+                length_scale=1.0,
+                noise_scale=0.667,
+                noise_w_scale=0.333,
+                speaker_id=0,
+            )
             buf = io.BytesIO()
             with wave.open(buf, "wb") as w:
                 w.setnchannels(1)
