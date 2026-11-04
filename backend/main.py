@@ -24,8 +24,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from faster_whisper import WhisperModel
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from models import Base, Conversation, Device
 import bcrypt
 from jose import jwt, JWTError
 
@@ -80,35 +81,6 @@ if not SECRET_KEY:
 DB_PATH = Path(__file__).parent / "bee.db"
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
-Base = declarative_base()
-
-
-class Conversation(Base):
-    __tablename__ = "conversations"
-
-    id = Column(Integer, primary_key=True, index=True)
-    device_id = Column(String, index=True)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    transcript = Column(Text)
-    summary = Column(Text, nullable=True)
-    reply = Column(Text, nullable=True)
-    todos = Column(Text, nullable=True)
-    raw_llm_response = Column(Text, nullable=True)
-    image_path = Column(Text, nullable=True)
-
-
-class Device(Base):
-    __tablename__ = "devices"
-
-    id = Column(Integer, primary_key=True, index=True)
-    device_id = Column(String, unique=True, index=True)
-    name = Column(String, nullable=True)
-    api_key_hash = Column(String, nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    last_seen_at = Column(DateTime, nullable=True)
-    enabled = Column(Integer, default=1)
-
-
 Base.metadata.create_all(bind=engine)
 
 # Load models

@@ -22,3 +22,6 @@ Thumbs.db
 
 # 3D prints (source files stay, generated STL can be added if wanted)
 *.gcode
+
+# Runtime audio replies
+audio_replies/
