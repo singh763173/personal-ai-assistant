@@ -346,6 +346,19 @@ async def text_to_speech(text: str, out_path: Path) -> bool:
         return False
 
 
+async def _generate_tts(conversation_id: int, text: str) -> str:
+    """Generate TTS audio for a reply and return the relative URL."""
+    if not text:
+        return ""
+    out_dir = Path(__file__).parent / "audio_replies"
+    out_dir.mkdir(exist_ok=True)
+    out_path = out_dir / f"{conversation_id}.mp3"
+    success = await text_to_speech(text, out_path)
+    if success:
+        return f"/api/v1/audio/{conversation_id}.mp3"
+    return ""
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
@@ -665,7 +678,8 @@ async def upload_image(
 
     transcript = "[image]"
     try:
-        reply = ask_ollama_vision(transcript, img_path)
+        img_b64 = base64.b64encode(Path(img_path).read_bytes()).decode("utf-8")
+        reply = ask_vision_llm(transcript, img_b64)
     except Exception as e:
         reply = f"Sorry, I couldn't analyze the image right now. Error: {e}"
 
