@@ -499,6 +499,7 @@ async def admin_gate(request: Request, call_next):
         "/api/v1/upload-image",
         "/api/v1/ask",
         "/api/v1/audio",
+        "/api/v1/metrics",
         "/login",
         "/api/v1/login",
     }
