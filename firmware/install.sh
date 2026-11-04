@@ -148,10 +148,15 @@ fi
 
 cd "$WHISPLAY_DIR"
 # The installer prompts "Proceed? [y/N]"; pre-answer yes for unattended operation.
-yes | bash install_driver.sh || {
-    log_error "Whisplay driver installation failed. See output above."
-    exit 1
-}
+if ! bash install_driver.sh <<< "y"; then
+    # Accept failure if the card is already configured / will load after reboot
+    if aplay -l 2>/dev/null | grep -qi "whisplay" ||        grep -q "^dtoverlay=whisplay-soundcard" /boot/firmware/config.txt 2>/dev/null; then
+        log_warn "Whisplay installer returned non-zero, but sound card is configured. Continuing."
+    else
+        log_error "Whisplay driver installation failed. See output above."
+        exit 1
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # 6. Install PiSugar power manager (battery monitoring)
