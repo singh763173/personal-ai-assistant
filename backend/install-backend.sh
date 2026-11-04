@@ -16,6 +16,7 @@
 # Environment variables (all optional):
 #   OLLAMA_MODEL      - default: kimi-k2.7-code:cloud
 #   WHISPER_MODEL     - default: base
+#   WHISPER_URL       - default: http://192.168.1.86:8001/transcribe (LAN-only AIServer01)
 #   OLLAMA_URL        - default: http://localhost:11434
 #   BEE_ADMIN_TOKEN   - admin token for device onboarding/dashboard
 #   CLOUDFLARE_TUNNEL_TOKEN - optional, creates cloudflared service if set
@@ -27,6 +28,7 @@ BACKEND_DIR="${BACKEND_DIR:-/opt/bee-backend}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-kimi-k2.7-code:cloud}"
 OLLAMA_VISION_MODEL="${OLLAMA_VISION_MODEL:-moondream:latest}"
+WHISPER_URL="${WHISPER_URL:-http://192.168.1.86:8001/transcribe}"
 WHISPER_MODEL="${WHISPER_MODEL:-base}"
 BEE_ADMIN_TOKEN="${BEE_ADMIN_TOKEN:-}"
 CLOUDFLARE_TUNNEL_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-}"
@@ -132,6 +134,8 @@ HEALTH_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo '127.0.0.1')"
 cat > "$BACKEND_DIR/.env" <<EOF
 OLLAMA_URL=$OLLAMA_URL
 OLLAMA_MODEL=$OLLAMA_MODEL
+OLLAMA_VISION_MODEL=$OLLAMA_VISION_MODEL
+WHISPER_URL=${WHISPER_URL:-http://192.168.1.86:8001/transcribe}
 WHISPER_MODEL=$WHISPER_MODEL
 WHISPER_DEVICE=cpu
 WHISPER_COMPUTE_TYPE=int8
