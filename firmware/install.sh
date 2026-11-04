@@ -95,9 +95,9 @@ apt install -y \
     libcamera-dev \
     libcamera-apps-lite \
     alsa-utils \
-    arecord \
+    alsa-utils \
     ffmpeg \
-    raspberrypi-kernel-headers \
+    linux-headers-rpi-v8 \
     dkms \
     build-essential
 
