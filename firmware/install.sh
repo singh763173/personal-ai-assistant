@@ -95,7 +95,6 @@ apt install -y \
     libcamera-dev \
     libcamera-apps-lite \
     alsa-utils \
-    alsa-utils \
     ffmpeg \
     linux-headers-rpi-v8 \
     dkms \
