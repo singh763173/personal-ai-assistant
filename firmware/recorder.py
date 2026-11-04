@@ -189,17 +189,25 @@ class BeeDeviceWhisplay:
             self._start_recording()
 
     def _on_double_click(self):
-        print(f"[{datetime.now(timezone.utc).isoformat()}] Double click: capture photo + ask")
+        print(f"[{datetime.now(timezone.utc).isoformat()}] Double click: capture photo + voice command")
         self._draw_status("Look at camera...", COLOR_ORANGE)
-        # Capture photo and immediately take a 5-second question recording
         img_path = self._capture_image()
         if not img_path:
             return
-        # Record 5s question
-        q_wav = self._start_recording()
-        time.sleep(5)
+        self._draw_status("Photo taken\nSpeak now...", COLOR_ORANGE)
+        # Start recording immediately after the photo
+        self._start_recording()
+        # Record up to 8 seconds; stop early if button is pressed again
+        max_record_seconds = 8.0
+        record_start = time.monotonic()
+        while time.monotonic() - record_start < max_record_seconds:
+            if self.board and self.board.button_pressed():
+                # User pressed button to finish early
+                break
+            time.sleep(0.05)
+        q_wav = self._stop_recording()
         self._draw_status("Processing...", COLOR_ORANGE)
-        self._upload_ask_with_image(img_path, self._stop_recording())
+        self._upload_ask_with_image(img_path, q_wav)
         self._cleanup(q_wav)
         self._cleanup(img_path)
 
