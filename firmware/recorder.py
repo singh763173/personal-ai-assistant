@@ -570,10 +570,8 @@ class BeeDeviceWhisplay:
         self.gif.stop()
         self._set_rgb(255, 0, 0)
         if self.camera:
-            try:
+            with contextlib.suppress(Exception):
                 self.camera.stop()
-            except Exception:
-                pass
         os.system("sudo shutdown -h now")
         time.sleep(10)
 
@@ -590,10 +588,8 @@ class BeeDeviceWhisplay:
             self.gif.stop()
             self._set_rgb(0, 0, 0)
             if self.board:
-                try:
+                with contextlib.suppress(Exception):
                     self.board.cleanup()
-                except Exception:
-                    pass
             if self.camera:
                 with contextlib.suppress(Exception):
                     self.camera.stop()
