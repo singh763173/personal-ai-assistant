@@ -180,16 +180,16 @@ def live_dashboard_frame(
     _draw_backend_dot(d, 10, 11, backend_online)
 
     # Wi-Fi bars (centre)
-    _draw_wifi_bars(d, WIDTH // 2 - 10, 12, wifi_rssi, wifi_connected)
+    _draw_wifi_bars(d, WIDTH // 2 - 12, 12, wifi_rssi, wifi_connected)
 
     # Battery icon + percentage (right)
     battery = max(0, min(100, int(battery_percent)))
     batt_colour = _battery_color(battery)
-    d.text((176, 11), f"{battery}%", font=_cache.font_tiny, fill=WHITE)
+    d.text((172, 11), f"{battery}%", font=_cache.font_tiny, fill=WHITE)
     # Battery body
-    d.rounded_rectangle((206, 11, 230, 21), radius=3, outline=MUTED, width=1)
+    d.rounded_rectangle((202, 11, 226, 21), radius=3, outline=MUTED, width=1)
     # Battery nib
-    d.rounded_rectangle((230, 14, 234, 18), radius=1, fill=MUTED)
+    d.rounded_rectangle((226, 14, 230, 18), radius=1, fill=MUTED)
     # Fill
     fill_width = round(battery / 100 * 20)
     if fill_width > 0:
