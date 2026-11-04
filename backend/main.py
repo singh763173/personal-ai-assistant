@@ -12,6 +12,8 @@ import base64
 import hashlib
 import json
 import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
 import secrets
 import time
 from datetime import UTC, datetime, timedelta
@@ -422,6 +424,9 @@ async def text_to_speech(text: str, out_path: Path) -> bool:
             syn_config.length_scale = 1.0
             buf = io.BytesIO()
             with wave.open(buf, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(22050)
                 voice.synthesize_wav(text, w, syn_config=syn_config)
             wav_bytes = buf.getvalue()
             tmp_wav = out_path.with_suffix(".wav")
