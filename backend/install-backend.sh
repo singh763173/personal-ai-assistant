@@ -218,6 +218,20 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
+# 7b. Optional nightly backup cron
+# ---------------------------------------------------------------------------
+if command -v ssh > /dev/null 2>&1; then
+    log_step "Installing nightly backup cron..."
+    (
+        crontab -l 2>/dev/null || true
+        echo "0 3 * * * $BACKEND_DIR/backup.sh >> /var/log/bee-backup.log 2>&1"
+    ) | crontab -
+    log_info "Backup cron installed at 03:00 daily."
+else
+    log_warn "ssh not installed; skipping backup cron."
+fi
+
+# ---------------------------------------------------------------------------
 # 8. Start backend and print instructions
 # ---------------------------------------------------------------------------
 log_step "Starting backend service..."

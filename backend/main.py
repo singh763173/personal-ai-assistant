@@ -13,6 +13,7 @@ import hashlib
 import base64
 import subprocess
 import asyncio
+import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
@@ -67,6 +68,47 @@ ADMIN_PASSWORD_HASH = os.getenv("BEE_ADMIN_PASSWORD_HASH", "")
 SECRET_KEY = os.getenv("BEE_SECRET_KEY", "")
 SESSION_COOKIE_NAME = "bee_session"
 SESSION_MAX_AGE_HOURS = 7 * 24
+
+
+# Retry helper for external network calls
+def _retry(max_attempts: int = 3, delay: float = 0.5, backoff: float = 2.0, exceptions=(Exception,)):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            wait = delay
+            last_exc = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    last_exc = e
+                    if attempt == max_attempts:
+                        break
+                    print(f"[retry] {func.__name__} attempt {attempt} failed: {e}; retrying in {wait:.1f}s")
+                    time.sleep(wait)
+                    wait *= backoff
+            raise last_exc
+        return wrapper
+    return decorator
+
+
+def _retry_async(max_attempts: int = 3, delay: float = 0.5, backoff: float = 2.0, exceptions=(Exception,)):
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            wait = delay
+            last_exc = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as e:
+                    last_exc = e
+                    if attempt == max_attempts:
+                        break
+                    print(f"[retry async] {func.__name__} attempt {attempt} failed: {e}; retrying in {wait:.1f}s")
+                    await asyncio.sleep(wait)
+                    wait *= backoff
+            raise last_exc
+        return wrapper
+    return decorator
 
 # Security
 MAX_UPLOAD_BYTES = int(os.getenv("BEE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
@@ -220,6 +262,7 @@ def _load_local_whisper():
     print("Whisper loaded.")
 
 
+@_retry(max_attempts=2, delay=0.3, backoff=1.5, exceptions=(Exception,))
 def transcribe(path: Path) -> str:
     if WHISPER_LOCAL:
         _load_local_whisper()
@@ -242,6 +285,7 @@ def transcribe(path: Path) -> str:
         return " ".join([seg.text.strip() for seg in segments]).strip()
 
 
+@_retry(max_attempts=3, delay=0.5, backoff=2.0, exceptions=(Exception,))
 def ask_ollama(transcript: str) -> dict:
     """Legacy summary/to-do extraction. Kept for /api/v1/upload compatibility."""
     prompt = f"""You are a helpful personal AI assistant reviewing an audio transcript captured from the user's day.
@@ -293,6 +337,7 @@ Respond ONLY as valid JSON with this exact structure:
         return {"summary": f"LLM error: {e}", "todos": [], "type": "error", "raw": str(e)}
 
 
+@_retry(max_attempts=3, delay=0.5, backoff=2.0, exceptions=(Exception,))
 def ask_llm(transcript: str) -> str:
     """Send transcript to a conversational LLM and return a spoken reply."""
     now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC on %A, %d %B %Y")
@@ -318,6 +363,7 @@ Reply as if speaking aloud. Keep it concise (1-3 sentences), friendly, and clear
         return f"Sorry, I couldn't get a response right now. Error: {e}"
 
 
+@_retry(max_attempts=3, delay=0.5, backoff=2.0, exceptions=(Exception,))
 def ask_vision_llm(transcript: str, image_base64: str) -> str:
     """Send image + transcript to a vision model and return a spoken reply."""
     now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC on %A, %d %B %Y")
@@ -344,6 +390,7 @@ Describe what you see in the image and answer the question. Reply as if speaking
         return f"Sorry, I couldn't analyze the image right now. Error: {e}"
 
 
+@_retry_async(max_attempts=3, delay=0.5, backoff=2.0, exceptions=(Exception,))
 async def text_to_speech(text: str, out_path: Path) -> bool:
     """Generate MP3 from text using edge-tts. Returns True on success."""
     try:
@@ -420,11 +467,39 @@ async def login_page():
 </body></html>""")
 
 
+
+# Simple in-memory brute-force protection for admin login
+_login_attempts: dict[str, tuple[int, float]] = {}
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCKOUT_SECONDS = 300
+
+
+def _check_login_rate(client_ip: str) -> bool:
+    now = time.time()
+    count, locked_until = _login_attempts.get(client_ip, (0, 0.0))
+    if now < locked_until:
+        return False
+    if now - locked_until > LOGIN_LOCKOUT_SECONDS and count >= MAX_LOGIN_ATTEMPTS:
+        # reset after lockout expires
+        _login_attempts[client_ip] = (0, 0.0)
+    return True
+
+
+def _record_login_failure(client_ip: str):
+    count, _ = _login_attempts.get(client_ip, (0, 0.0))
+    count += 1
+    locked_until = time.time() + LOGIN_LOCKOUT_SECONDS if count >= MAX_LOGIN_ATTEMPTS else 0.0
+    _login_attempts[client_ip] = (count, locked_until)
+
 @app.post("/api/v1/login")
 async def login(request: Request, username: str = Form(...), password: str = Form(...)):
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_login_rate(client_ip):
+        return RedirectResponse(url="/login?error=Too+many+failed+attempts.+Try+again+in+5+minutes.", status_code=302)
     if not ADMIN_USERNAME or not ADMIN_PASSWORD_HASH:
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Admin credentials not configured")
     if username != ADMIN_USERNAME or not _verify_password(password, ADMIN_PASSWORD_HASH):
+        _record_login_failure(client_ip)
         return RedirectResponse(url="/login?error=Invalid+username+or+password", status_code=302)
     token = _create_session_token(username)
     response = RedirectResponse(url="/dashboard", status_code=302)
@@ -723,6 +798,76 @@ async def upload_image(
         )
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+def _cleanup_old_files():
+    """Remove stale temp uploads and audio replies beyond retention."""
+    now = time.time()
+    retention_seconds = 7 * 24 * 3600  # 7 days for audio replies
+    temp_retention_seconds = 24 * 3600   # 1 day for /tmp uploads
+
+    # Clean /tmp/bee-uploads
+    tmp_dir = Path("/tmp/bee-uploads")
+    if tmp_dir.exists():
+        for p in tmp_dir.iterdir():
+            try:
+                if p.is_file() and (now - p.stat().st_mtime) > temp_retention_seconds:
+                    p.unlink()
+            except Exception as e:
+                print(f"Cleanup temp failed for {p}: {e}")
+
+    # Clean audio_replies older than retention
+    audio_dir = Path(__file__).parent / "audio_replies"
+    if audio_dir.exists():
+        for p in audio_dir.iterdir():
+            try:
+                if p.is_file() and (now - p.stat().st_mtime) > retention_seconds:
+                    p.unlink()
+            except Exception as e:
+                print(f"Cleanup audio failed for {p}: {e}")
+
+
+@app.middleware("http")
+async def cleanup_middleware(request: Request, call_next):
+    # Run cleanup infrequently (every ~100 requests) to avoid overhead
+    if getattr(app.state, "request_count", 0) % 100 == 0:
+        _cleanup_old_files()
+    app.state.request_count = getattr(app.state, "request_count", 0) + 1
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+@app.get("/api/v1/metrics", dependencies=[Depends(_require_admin_session)])
+async def metrics(db: SessionLocal = Depends(get_db)):
+    """Basic operational metrics for the backend."""
+    conv_count = db.query(Conversation).count()
+    device_count = db.query(Device).count()
+    audio_dir = Path(__file__).parent / "audio_replies"
+    audio_size = sum(f.stat().st_size for f in audio_dir.iterdir() if f.is_file()) if audio_dir.exists() else 0
+    db_size = Path(__file__).parent.joinpath("bee.db").stat().st_size
+    whisper_healthy = False
+    try:
+        if WHISPER_URL:
+            headers = {"Authorization": WHISPER_API_KEY} if WHISPER_API_KEY else {}
+            r = requests.get(f"{WHISPER_URL.replace('/transcribe', '/health')}", headers=headers, timeout=5)
+            whisper_healthy = r.status_code == 200
+    except Exception:
+        pass
+    return {
+        "conversations": conv_count,
+        "devices": device_count,
+        "audio_replies_bytes": audio_size,
+        "database_bytes": db_size,
+        "request_count": getattr(app.state, "request_count", 0),
+        "whisper_healthy": whisper_healthy,
+        "timestamp": _now().isoformat(),
+    }
+
 
 @app.get("/api/v1/health")
 async def health():
