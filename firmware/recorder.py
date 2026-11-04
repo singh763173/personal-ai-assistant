@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Ollama Bee Device firmware v2.2 (PiSugar Whisplay HAT + PiSugar 3 battery)
+Ollama Bee Device firmware v2.3 (PiSugar Whisplay HAT + PiSugar 3 battery)
 
-Button mappings:
+Button mappings (Whisplay single button on GPIO):
 - Single click: toggle mute / recording
 - Double click: capture and upload a photo immediately
 - Long press (~2 s): safe shutdown
-
-Reads battery level from PiSugar power-manager server and displays it on the LCD.
 """
 import os
 import time
@@ -29,8 +27,14 @@ except Exception as e:
     HAS_CAMERA = False
 
 try:
-    import whisplay
     from PIL import Image, ImageDraw, ImageFont
+    HAS_PIL = True
+except Exception as e:
+    print(f"PIL import failed: {e}")
+    HAS_PIL = False
+
+try:
+    import whisplay
     HAS_WHISPLAY = True
 except Exception as e:
     print(f"Whisplay runtime not found: {e}")
@@ -39,6 +43,7 @@ except Exception as e:
 # Config from env
 BACKEND_URL = os.getenv("BEE_BACKEND_URL", "http://192.168.1.86:8000")
 DEVICE_ID = os.getenv("BEE_DEVICE_ID", "bee-pioneer-01")
+API_KEY = os.getenv("BEE_API_KEY", "")
 CHUNK_SECONDS = int(os.getenv("BEE_CHUNK_SECONDS", "30"))
 SAMPLE_RATE = int(os.getenv("BEE_SAMPLE_RATE", "16000"))
 AUDIO_CHANNELS = int(os.getenv("BEE_AUDIO_CHANNELS", "2"))
@@ -58,6 +63,20 @@ COLOR_YELLOW = (255, 200, 0)
 COLOR_ORANGE = (255, 100, 0)
 
 
+def rgb565_bytes(img: Image.Image) -> bytes:
+    """Convert a PIL RGB image to RGB565 big-endian bytes for the Whisplay LCD."""
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    pixels = list(img.getdata())
+    out = bytearray(len(pixels) * 2)
+    for i, (r, g, b) in enumerate(pixels):
+        # RGB565: RRRRRGGG GGGBBBBB
+        val = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        out[2 * i] = (val >> 8) & 0xFF
+        out[2 * i + 1] = val & 0xFF
+    return bytes(out)
+
+
 class BeeDeviceWhisplay:
     def __init__(self):
         self.muted = True
@@ -68,10 +87,16 @@ class BeeDeviceWhisplay:
         self.session = requests.Session()
 
         self.board = None
-        self.button = None
-        self.lcd = None
-        self.led = None
         self.camera = None
+
+        # Button gesture state
+        self._last_press_time = 0.0
+        self._press_start = 0.0
+        self._release_callbacks = []
+        self._long_press_triggered = False
+        self._double_click_window = 0.4
+        self._click_count = 0
+        self._last_click_time = 0.0
 
         self._init_whisplay()
         self._init_camera()
@@ -81,16 +106,11 @@ class BeeDeviceWhisplay:
             print("Running without Whisplay HAT hardware.")
             return
         try:
-            self.board = whisplay.Board()
-            self.button = whisplay.Button(self.board)
-            self.lcd = whisplay.LCD(self.board, width=240, height=280)
-            self.led = whisplay.LED(self.board)
-
-            self.button.on_click = self._on_single_click
-            self.button.on_double_click = self._on_double_click
-            self.button.on_long_press = self._on_long_press
-
-            self._set_led(COLOR_BLUE)
+            self.board = whisplay.WhisplayBoard()
+            self.board.on_button_press(self._on_button_press)
+            self.board.on_button_release(self._on_button_release)
+            self.board.set_backlight(100)
+            self.board.set_rgb(0, 0, 255)
             self._draw_status("Bee\nReady")
             print("Whisplay HAT initialized.")
         except Exception as e:
@@ -111,6 +131,43 @@ class BeeDeviceWhisplay:
             print(f"Camera init failed: {e}")
             self.camera = None
 
+    def _on_button_press(self):
+        self._press_start = time.monotonic()
+        self._long_press_triggered = False
+
+    def _on_button_release(self):
+        now = time.monotonic()
+        press_duration = now - self._press_start
+        if press_duration >= LONG_PRESS_SECONDS:
+            if not self._long_press_triggered:
+                self._long_press_triggered = True
+                self._on_long_press()
+            return
+
+        # Click detection
+        self._click_count += 1
+        if self._click_count == 1:
+            # Wait for possible second click
+            threading.Thread(target=self._handle_click_gesture, args=(now,), daemon=True).start()
+
+    def _handle_click_gesture(self, first_click_time):
+        time.sleep(self._double_click_window)
+        with self.lock:
+            count = self._click_count
+            self._click_count = 0
+        if count >= 2:
+            self._on_double_click()
+        elif count == 1:
+            self._on_single_click()
+
+    def _check_long_press(self):
+        while True:
+            if self.board and not self._long_press_triggered and self._press_start > 0:
+                if time.monotonic() - self._press_start >= LONG_PRESS_SECONDS:
+                    self._long_press_triggered = True
+                    self._on_long_press()
+            time.sleep(0.1)
+
     def _on_single_click(self):
         with self.lock:
             self.muted = not self.muted
@@ -127,7 +184,7 @@ class BeeDeviceWhisplay:
     def _on_long_press(self):
         print(f"[{datetime.now(timezone.utc).isoformat()}] Long press: shutting down")
         self._draw_status("Shutting\ndown...", COLOR_RED)
-        self._set_led(COLOR_RED)
+        self._set_rgb(COLOR_RED)
         self._shutdown()
 
     def _shutdown(self):
@@ -139,10 +196,10 @@ class BeeDeviceWhisplay:
         os.system("sudo shutdown -h now")
         time.sleep(10)
 
-    def _set_led(self, color):
-        if self.led:
+    def _set_rgb(self, color):
+        if self.board:
             try:
-                self.led.set_color(*color)
+                self.board.set_rgb(*color)
             except Exception as e:
                 print(f"LED set failed: {e}")
 
@@ -151,14 +208,13 @@ class BeeDeviceWhisplay:
             r = self.session.get(f"{PISUGAR_API}/api/power", timeout=5)
             r.raise_for_status()
             data = r.json()
-            # PiSugar server returns different fields depending on version
             return data.get("battery_percentage") or data.get("battery") or data.get("level")
         except Exception as e:
             print(f"Battery read failed: {e}")
             return None
 
     def _draw_status(self, text, color=COLOR_WHITE):
-        if not self.lcd:
+        if not self.board or not HAS_PIL:
             return
         try:
             img = Image.new("RGB", (240, 280), COLOR_BLACK)
@@ -183,17 +239,17 @@ class BeeDeviceWhisplay:
                 status_line += f"  Bat:{self.battery_level}%"
             draw.text((10, 250), status_line, font=small, fill=COLOR_YELLOW)
 
-            self.lcd.show(img)
+            self.board.draw_image(0, 0, 240, 280, rgb565_bytes(img))
         except Exception as e:
             print(f"LCD draw failed: {e}")
 
     def _update_display(self):
         if self.muted:
             self._draw_status("Muted\n[click to record]", COLOR_RED)
-            self._set_led(COLOR_RED)
+            self._set_rgb(COLOR_RED)
         else:
             self._draw_status("Recording...\n[click to mute]", COLOR_GREEN)
-            self._set_led(COLOR_GREEN)
+            self._set_rgb(COLOR_GREEN)
 
     def _record_chunk(self, duration_seconds: int) -> Path:
         tmp_dir = Path(tempfile.gettempdir()) / "bee-device"
@@ -235,7 +291,11 @@ class BeeDeviceWhisplay:
             with open(file_path, "rb") as f:
                 files = {field_name: (file_path.name, f, "audio/wav" if file_path.suffix == ".wav" else "image/jpeg")}
                 data = {"device_id": DEVICE_ID}
-                resp = self.session.post(url, files=files, data=data, timeout=60)
+                if API_KEY:
+                    headers = {"Authorization": API_KEY}
+                else:
+                    headers = {}
+                resp = self.session.post(url, files=files, data=data, headers=headers, timeout=60)
                 resp.raise_for_status()
                 print(f"Upload OK: {resp.status_code}")
                 return True
@@ -286,7 +346,12 @@ class BeeDeviceWhisplay:
         except KeyboardInterrupt:
             print("Shutting down...")
         finally:
-            self._set_led(COLOR_BLACK)
+            self._set_rgb(COLOR_BLACK)
+            if self.board:
+                try:
+                    self.board.cleanup()
+                except Exception:
+                    pass
             if self.camera:
                 try:
                     self.camera.stop()
