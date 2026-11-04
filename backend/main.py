@@ -6,30 +6,29 @@ FastAPI backend for the Ollama Bee Device.
 - Stores conversations in SQLite
 - Serves a dashboard for device onboarding and transcript review
 """
-import os
-import json
-import secrets
-import hashlib
-import base64
-import subprocess
-import asyncio
-import time
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
-from typing import List, Optional
 
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import secrets
+import time
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import bcrypt
 import requests
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Depends, Request, status, Response
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, status
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
 from faster_whisper import WhisperModel
+from jose import JWTError, jwt
+from models import Base, Conversation, Device
+from pydantic import BaseModel, Field
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from models import Base, Conversation, Device
-import bcrypt
-from jose import jwt, JWTError
 
 app = FastAPI(title="Ollama Bee Backend")
 
@@ -87,7 +86,9 @@ def _retry(max_attempts: int = 3, delay: float = 0.5, backoff: float = 2.0, exce
                     time.sleep(wait)
                     wait *= backoff
             raise last_exc
+
         return wrapper
+
     return decorator
 
 
@@ -107,8 +108,11 @@ def _retry_async(max_attempts: int = 3, delay: float = 0.5, backoff: float = 2.0
                     await asyncio.sleep(wait)
                     wait *= backoff
             raise last_exc
+
         return wrapper
+
     return decorator
+
 
 # Security
 MAX_UPLOAD_BYTES = int(os.getenv("BEE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
@@ -138,15 +142,15 @@ else:
 class UploadResponse(BaseModel):
     conversation_id: int
     transcript: str
-    summary: Optional[str] = None
-    reply: Optional[str] = None
-    todos: List[str]
-    audio_url: Optional[str] = None
+    summary: str | None = None
+    reply: str | None = None
+    todos: list[str]
+    audio_url: str | None = None
 
 
 class OnboardRequest(BaseModel):
     device_id: str = Field(..., min_length=1, max_length=64)
-    name: Optional[str] = Field(None, max_length=128)
+    name: str | None = Field(None, max_length=128)
 
 
 class OnboardResponse(BaseModel):
@@ -172,7 +176,7 @@ def _safe_device_id(device_id: str) -> str:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _verify_password(plain: str, hashed: str) -> bool:
@@ -191,7 +195,7 @@ def _create_session_token(username: str) -> str:
     return jwt.encode({"sub": username, "exp": exp}, SECRET_KEY, algorithm="HS256")
 
 
-def _get_session_user(request: Request) -> Optional[str]:
+def _get_session_user(request: Request) -> str | None:
     token = request.cookies.get(SESSION_COOKIE_NAME)
     if not token:
         return None
@@ -202,7 +206,7 @@ def _get_session_user(request: Request) -> Optional[str]:
         return None
 
 
-def _extract_token(request: Request, credentials: Optional[HTTPAuthorizationCredentials]) -> str:
+def _extract_token(request: Request, credentials: HTTPAuthorizationCredentials | None) -> str:
     if credentials and credentials.credentials:
         token = credentials.credentials.strip()
         if token.lower().startswith("bearer "):
@@ -228,7 +232,11 @@ def _require_admin_session(request: Request):
     return user
 
 
-def _require_device(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security), db: SessionLocal = Depends(get_db)):
+def _require_device(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    db: SessionLocal = Depends(get_db),
+):
     key = _extract_token(request, credentials)
     if not key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing Authorization header")
@@ -340,7 +348,7 @@ Respond ONLY as valid JSON with this exact structure:
 @_retry(max_attempts=3, delay=0.5, backoff=2.0, exceptions=(Exception,))
 def ask_llm(transcript: str) -> str:
     """Send transcript to a conversational LLM and return a spoken reply."""
-    now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC on %A, %d %B %Y")
+    now = datetime.now(UTC).strftime("%H:%M:%S UTC on %A, %d %B %Y")
     prompt = f"""You are a helpful voice assistant in a wearable device. The user just spoke to you.
 Current date and time: {now}.
 
@@ -366,7 +374,7 @@ Reply as if speaking aloud. Keep it concise (1-3 sentences), friendly, and clear
 @_retry(max_attempts=3, delay=0.5, backoff=2.0, exceptions=(Exception,))
 def ask_vision_llm(transcript: str, image_base64: str) -> str:
     """Send image + transcript to a vision model and return a spoken reply."""
-    now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC on %A, %d %B %Y")
+    now = datetime.now(UTC).strftime("%H:%M:%S UTC on %A, %d %B %Y")
     prompt = f"""You are a helpful voice assistant in a wearable camera. The user took a photo and asked you about it.
 Current date and time: {now}.
 
@@ -395,6 +403,7 @@ async def text_to_speech(text: str, out_path: Path) -> bool:
     """Generate MP3 from text using edge-tts. Returns True on success."""
     try:
         import edge_tts
+
         communicate = edge_tts.Communicate(text, "en-GB-SoniaNeural")
         await communicate.save(str(out_path))
         return out_path.exists() and out_path.stat().st_size > 0
@@ -437,7 +446,15 @@ async def admin_gate(request: Request, call_next):
     Everything else requires an authenticated session.
     """
     path = request.url.path
-    public_paths = {"/api/v1/health", "/api/v1/upload", "/api/v1/upload-image", "/api/v1/ask", "/api/v1/audio", "/login", "/api/v1/login"}
+    public_paths = {
+        "/api/v1/health",
+        "/api/v1/upload",
+        "/api/v1/upload-image",
+        "/api/v1/ask",
+        "/api/v1/audio",
+        "/login",
+        "/api/v1/login",
+    }
     if any(path == p or path.startswith(p + "/") for p in public_paths):
         return await call_next(request)
 
@@ -445,7 +462,9 @@ async def admin_gate(request: Request, call_next):
     user = _get_session_user(request)
     if user != ADMIN_USERNAME:
         if request.headers.get("accept", "").startswith("application/json"):
-            return JSONResponse(status_code=401, content={"detail": "Login required"}, headers={"WWW-Authenticate": "Bearer"})
+            return JSONResponse(
+                status_code=401, content={"detail": "Login required"}, headers={"WWW-Authenticate": "Bearer"}
+            )
         return RedirectResponse(url="/login", status_code=302)
     return await call_next(request)
 
@@ -455,7 +474,8 @@ async def login_page():
     login_path = Path(__file__).parent / "static" / "login.html"
     if login_path.exists():
         return HTMLResponse(content=login_path.read_text())
-    return HTMLResponse(content="""<!DOCTYPE html>
+    return HTMLResponse(
+        content="""<!DOCTYPE html>
 <html><head><title>Login</title></head>
 <body style="font-family:system-ui; background:#0f172a; color:#e2e8f0; padding:2rem;">
 <h1>Login</h1>
@@ -464,8 +484,8 @@ async def login_page():
 <input name="password" type="password" placeholder="Password" style="padding:0.5rem; margin:0.25rem;" required><br>
 <button type="submit" style="padding:0.5rem 1rem; margin:0.25rem;">Login</button>
 </form>
-</body></html>""")
-
+</body></html>"""
+    )
 
 
 # Simple in-memory brute-force protection for admin login
@@ -490,6 +510,7 @@ def _record_login_failure(client_ip: str):
     count += 1
     locked_until = time.time() + LOGIN_LOCKOUT_SECONDS if count >= MAX_LOGIN_ATTEMPTS else 0.0
     _login_attempts[client_ip] = (count, locked_until)
+
 
 @app.post("/api/v1/login")
 async def login(request: Request, username: str = Form(...), password: str = Form(...)):
@@ -588,7 +609,9 @@ async def upload_audio(
 
     body = await audio.read()
     if len(body) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Max upload size is {MAX_UPLOAD_BYTES} bytes")
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Max upload size is {MAX_UPLOAD_BYTES} bytes"
+        )
 
     tmp_dir = Path("/tmp/bee-uploads")
     tmp_dir.mkdir(exist_ok=True)
@@ -628,7 +651,7 @@ async def upload_audio(
 async def ask_endpoint(
     request: Request,
     audio: UploadFile = File(...),
-    image: Optional[UploadFile] = File(None),
+    image: UploadFile | None = File(None),
     device_id: str = Form("unknown"),
     device: Device = Depends(_rate_limit),
 ):
@@ -638,7 +661,9 @@ async def ask_endpoint(
 
     audio_body = await audio.read()
     if len(audio_body) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Max upload size is {MAX_UPLOAD_BYTES} bytes")
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Max upload size is {MAX_UPLOAD_BYTES} bytes"
+        )
 
     tmp_dir = Path("/tmp/bee-uploads")
     tmp_dir.mkdir(exist_ok=True)
@@ -653,21 +678,25 @@ async def ask_endpoint(
         if image and image.filename:
             img_ext = Path(image.filename).suffix.lower()
             if img_ext not in (".jpg", ".jpeg", ".png"):
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .jpg/.jpeg/.png images supported")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, detail="Only .jpg/.jpeg/.png images supported"
+                )
             img_body = await image.read()
             if len(img_body) > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Max image size is {MAX_UPLOAD_BYTES} bytes")
-            image_path = tmp_dir / f"{_now().strftime('%Y%m%d-%H%M%S-%f')}-{_safe_device_id(device_id)}-{image.filename}"
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Max image size is {MAX_UPLOAD_BYTES} bytes",
+                )
+            image_path = (
+                tmp_dir / f"{_now().strftime('%Y%m%d-%H%M%S-%f')}-{_safe_device_id(device_id)}-{image.filename}"
+            )
             with open(image_path, "wb") as f:
                 f.write(img_body)
             image_b64 = base64.b64encode(img_body).decode("utf-8")
 
         transcript = transcribe(wav_path)
 
-        if image_b64:
-            reply = ask_vision_llm(transcript, image_b64)
-        else:
-            reply = ask_llm(transcript)
+        reply = ask_vision_llm(transcript, image_b64) if image_b64 else ask_llm(transcript)
 
         # Generate spoken reply
         audio_dir = Path(__file__).parent / "audio_replies"
@@ -722,7 +751,7 @@ async def get_audio_reply(conversation_id: int):
 
 
 @app.get("/api/v1/conversations", dependencies=[Depends(_require_admin_session)])
-async def list_conversations(limit: int = 50, device_id: Optional[str] = None, db: SessionLocal = Depends(get_db)):
+async def list_conversations(limit: int = 50, device_id: str | None = None, db: SessionLocal = Depends(get_db)):
     query = db.query(Conversation)
     if device_id:
         query = query.filter(Conversation.device_id == device_id)
@@ -753,12 +782,13 @@ async def upload_image(
     """Vision-only endpoint: describe what the camera sees and reply with spoken audio."""
     tmp_dir = Path("/tmp/bee-uploads")
     tmp_dir.mkdir(exist_ok=True)
-    suffix = Path(image.filename).suffix or ".jpg"
     img_path = tmp_dir / f"{_now().strftime('%Y%m%d-%H%M%S-%f')}-{_safe_device_id(device_id)}-{image.filename}"
 
     body = await image.read()
     if len(body) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Max upload size is {MAX_UPLOAD_BYTES} bytes")
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Max upload size is {MAX_UPLOAD_BYTES} bytes"
+        )
 
     with open(img_path, "wb") as f:
         f.write(body)
@@ -807,7 +837,7 @@ def _cleanup_old_files():
     """Remove stale temp uploads and audio replies beyond retention."""
     now = time.time()
     retention_seconds = 7 * 24 * 3600  # 7 days for audio replies
-    temp_retention_seconds = 24 * 3600   # 1 day for /tmp uploads
+    temp_retention_seconds = 24 * 3600  # 1 day for /tmp uploads
 
     # Clean /tmp/bee-uploads
     tmp_dir = Path("/tmp/bee-uploads")

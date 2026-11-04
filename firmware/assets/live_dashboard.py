@@ -14,7 +14,6 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-
 WIDTH, HEIGHT = 240, 280
 HERE = Path(__file__).resolve().parent
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -84,8 +83,9 @@ def live_dashboard_frame(
     d.text((183, 12), f"{battery}%", fill=WHITE, font=_cache.font_tiny)
     d.rounded_rectangle((216, 13, 231, 23), radius=2, outline=MUTED, width=1)
     d.rounded_rectangle((231, 16, 233, 20), radius=1, fill=MUTED)
-    d.rounded_rectangle((218, 15, 218 + 2 + round(battery / 100 * 10), 21),
-                        radius=1, fill=CYAN if battery > 20 else (255, 130, 135))
+    d.rounded_rectangle(
+        (218, 15, 218 + 2 + round(battery / 100 * 10), 21), radius=1, fill=CYAN if battery > 20 else (255, 130, 135)
+    )
 
     assert image.size == (WIDTH, HEIGHT)
     return image

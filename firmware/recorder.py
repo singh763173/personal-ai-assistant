@@ -6,22 +6,23 @@ States:
   DASHBOARD -> LISTENING -> PROCESSING -> SPEAKING -> RETURN_HOME -> DASHBOARD
   DASHBOARD -> CAMERA_VOICE -> PROCESSING -> SPEAKING -> RETURN_HOME -> DASHBOARD
 """
+
+import contextlib
 import os
-import sys
-import time
 import subprocess
-import threading
-import json
+import sys
 import tempfile
-import wave
+import threading
+import time
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, timezone
 
 import requests
 
 # Optional hardware libraries
 try:
     from picamera2 import Picamera2
+
     HAS_CAMERA = True
 except Exception as e:
     print(f"Camera import failed: {e}")
@@ -29,6 +30,7 @@ except Exception as e:
 
 try:
     from PIL import Image
+
     HAS_PIL = True
 except Exception as e:
     print(f"PIL import failed: {e}")
@@ -36,6 +38,7 @@ except Exception as e:
 
 try:
     import whisplay
+
     HAS_WHISPLAY = True
 except Exception as e:
     print(f"Whisplay runtime not found: {e}")
@@ -46,6 +49,7 @@ ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 sys.path.insert(0, str(ASSETS_DIR))
 try:
     from live_dashboard import live_dashboard_frame
+
     HAS_LIVE_DASHBOARD = True
 except Exception as e:
     print(f"live_dashboard import failed: {e}")
@@ -160,8 +164,13 @@ class GifPlayer:
 
 class BeeDeviceWhisplay:
     STATES = {
-        "DASHBOARD", "LISTENING", "CAMERA_VOICE", "PROCESSING",
-        "SPEAKING", "RETURN_HOME", "SHUTDOWN",
+        "DASHBOARD",
+        "LISTENING",
+        "CAMERA_VOICE",
+        "PROCESSING",
+        "SPEAKING",
+        "RETURN_HOME",
+        "SHUTDOWN",
     }
 
     def __init__(self):
@@ -198,7 +207,7 @@ class BeeDeviceWhisplay:
             raise ValueError(f"Unknown state {new_state}")
         with self._state_lock:
             self._state = new_state
-        print(f"[{datetime.now(timezone.utc).isoformat()}] State -> {new_state}")
+        print(f"[{datetime.now(UTC).isoformat()}] State -> {new_state}")
 
     def _init_whisplay(self):
         if not HAS_WHISPLAY:
@@ -311,15 +320,19 @@ class BeeDeviceWhisplay:
     def _start_recording(self) -> Path:
         tmp_dir = Path(tempfile.gettempdir()) / "bee-device"
         tmp_dir.mkdir(exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
         wav_path = tmp_dir / f"{DEVICE_ID}-{stamp}.wav"
 
         cmd = [
             "arecord",
-            "-D", f"hw:{AUDIO_CARD}",
-            "-c", str(AUDIO_CHANNELS),
-            "-r", str(SAMPLE_RATE),
-            "-f", "S16_LE",
+            "-D",
+            f"hw:{AUDIO_CARD}",
+            "-c",
+            str(AUDIO_CHANNELS),
+            "-r",
+            str(SAMPLE_RATE),
+            "-f",
+            "S16_LE",
             str(wav_path),
         ]
         print(f"[REC] Start -> {wav_path}")
@@ -390,11 +403,13 @@ class BeeDeviceWhisplay:
             wav_path = self._start_recording()
             # Wait for button release or max duration
             release_event = threading.Event()
+
             def wait_release():
                 # The button release callback will set _recording_stop_event when detected
                 while self.state == "CAMERA_VOICE" and not self._recording_stop_event.is_set():
                     time.sleep(0.05)
                 release_event.set()
+
             threading.Thread(target=wait_release, daemon=True).start()
             release_event.wait(timeout=CAMERA_MAX_SECONDS)
             wav_path = self._stop_recording()
@@ -410,7 +425,7 @@ class BeeDeviceWhisplay:
             return None
         tmp_dir = Path(tempfile.gettempdir()) / "bee-device"
         tmp_dir.mkdir(exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
         raw_path = tmp_dir / f"{DEVICE_ID}-{stamp}-raw.jpg"
         img_path = tmp_dir / f"{DEVICE_ID}-{stamp}.jpg"
         try:
@@ -498,10 +513,8 @@ class BeeDeviceWhisplay:
         self._enter_dashboard()
 
     def _cleanup(self, path: Path):
-        try:
+        with contextlib.suppress(Exception):
             path.unlink()
-        except Exception:
-            pass
 
     # ---- Button handling ----
 
@@ -582,10 +595,8 @@ class BeeDeviceWhisplay:
                 except Exception:
                     pass
             if self.camera:
-                try:
+                with contextlib.suppress(Exception):
                     self.camera.stop()
-                except Exception:
-                    pass
 
 
 if __name__ == "__main__":
