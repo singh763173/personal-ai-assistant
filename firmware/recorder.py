@@ -101,6 +101,10 @@ class BeeDeviceWhisplay:
         self._init_whisplay()
         self._init_camera()
 
+        self._recorder_proc = None
+        self._recorder_path = None
+        self._recorder_lock = threading.Lock()
+
     def _init_whisplay(self):
         if not HAS_WHISPLAY:
             print("Running without Whisplay HAT hardware.")
@@ -171,9 +175,16 @@ class BeeDeviceWhisplay:
     def _on_single_click(self):
         with self.lock:
             self.muted = not self.muted
-        state = "muted" if self.muted else "recording"
+            now_muted = self.muted
+        state = "muted" if now_muted else "recording"
         print(f"[{datetime.now(timezone.utc).isoformat()}] Single click: {state}")
         self._update_display()
+        if now_muted:
+            # Stopped: upload immediately
+            threading.Thread(target=self._upload_last_recording, daemon=True).start()
+        else:
+            # Started: begin continuous recording
+            self._start_recording()
 
     def _on_double_click(self):
         print(f"[{datetime.now(timezone.utc).isoformat()}] Double click: capture photo")
@@ -251,7 +262,7 @@ class BeeDeviceWhisplay:
             self._draw_status("Recording...\n[click to mute]", COLOR_GREEN)
             self._set_rgb(COLOR_GREEN)
 
-    def _record_chunk(self, duration_seconds: int) -> Path:
+    def _start_recording(self) -> Path:
         tmp_dir = Path(tempfile.gettempdir()) / "bee-device"
         tmp_dir.mkdir(exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
@@ -263,11 +274,31 @@ class BeeDeviceWhisplay:
             "-c", str(AUDIO_CHANNELS),
             "-r", str(SAMPLE_RATE),
             "-f", "S16_LE",
-            "-d", str(duration_seconds),
             str(wav_path),
         ]
-        print(f"Recording {duration_seconds}s -> {wav_path}")
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[REC] Started recording -> {wav_path}")
+        with self._recorder_lock:
+            self._recorder_path = wav_path
+            self._recorder_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return wav_path
+
+    def _stop_recording(self) -> Path:
+        with self._recorder_lock:
+            proc = self._recorder_proc
+            wav_path = self._recorder_path
+            self._recorder_proc = None
+            self._recorder_path = None
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+        print(f"[REC] Stopped recording -> {wav_path}")
         return wav_path
 
     def _capture_image(self) -> Path:
@@ -303,6 +334,15 @@ class BeeDeviceWhisplay:
             print(f"Upload failed: {e}")
             return False
 
+    def _upload_last_recording(self):
+        wav_path = self._stop_recording()
+        if wav_path and wav_path.exists():
+            self.last_upload_ok = self._upload_file("/api/v1/upload", "audio", wav_path)
+            self._cleanup(wav_path)
+        else:
+            print("[REC] No recording to upload")
+        self._update_display()
+
     def _capture_and_upload(self):
         img_path = self._capture_image()
         if img_path:
@@ -324,25 +364,12 @@ class BeeDeviceWhisplay:
 
         try:
             while True:
-                if self.muted:
-                    time.sleep(0.5)
-                    if ENABLE_CAMERA and (time.time() - last_camera_time) > CAMERA_INTERVAL:
-                        self._capture_and_upload()
-                        last_camera_time = time.time()
-                        self._update_display()
-                    continue
-
-                self._update_display()
-                wav_path = self._record_chunk(CHUNK_SECONDS)
-                self.last_upload_ok = self._upload_file("/api/v1/upload", "audio", wav_path)
-                self._cleanup(wav_path)
-
-                if ENABLE_CAMERA and (time.time() - last_camera_time) > CAMERA_INTERVAL:
+                time.sleep(0.5)
+                # Periodic camera photo while muted
+                if self.muted and ENABLE_CAMERA and (time.time() - last_camera_time) > CAMERA_INTERVAL:
                     self._capture_and_upload()
                     last_camera_time = time.time()
-
-                self._update_display()
-                time.sleep(1)
+                    self._update_display()
         except KeyboardInterrupt:
             print("Shutting down...")
         finally:
