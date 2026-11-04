@@ -365,7 +365,7 @@ async def admin_gate(request: Request, call_next):
     Everything else requires an authenticated session.
     """
     path = request.url.path
-    public_paths = {"/api/v1/health", "/api/v1/upload", "/login", "/api/v1/login"}
+    public_paths = {"/api/v1/health", "/api/v1/upload", "/api/v1/ask", "/login", "/api/v1/login"}
     if path in public_paths:
         return await call_next(request)
     if path.startswith("/static/"):
