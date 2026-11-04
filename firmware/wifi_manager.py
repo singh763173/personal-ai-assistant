@@ -90,7 +90,15 @@ class WiFiManager:
         KNOWN_WIFI_PATH.write_text(json.dumps(self.known_networks, indent=2))
 
     def apply_known_networks(self):
-        """Regenerate wpa_supplicant.conf from known networks."""
+        """Regenerate wpa_supplicant.conf from known networks.
+
+        If no known networks are configured yet, leave the existing
+        wpa_supplicant.conf in place so the device keeps its current
+        connection.
+        """
+        if not self.known_networks:
+            print("No known networks configured; leaving existing wpa_supplicant.conf")
+            return
         lines = [
             "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev",
             "update_config=1",
