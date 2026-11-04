@@ -920,14 +920,16 @@ async def cleanup_middleware(request: Request, call_next):
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
-async def _require_admin_or_device(
-    request: Request,
-    user: str | None = Depends(_require_admin_session),
-    device: Device | None = Depends(_require_device),
-):
+async def _require_admin_or_device(request: Request):
     """Allow either a logged-in admin or an authenticated device to view metrics."""
-    if user or device:
-        return user or device
+    try:
+        return _get_session_user(request)
+    except HTTPException:
+        pass
+    try:
+        return await _require_device(request)
+    except HTTPException:
+        pass
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Login required")
 
 
@@ -960,7 +962,13 @@ async def metrics(db: SessionLocal = Depends(get_db)):
 
 @app.get("/api/v1/health")
 async def health():
-    return {"status": "ok", "ollama_model": OLLAMA_MODEL, "whisper_model": WHISPER_MODEL, "version": "1.2.0"}
+    return {
+        "status": "ok",
+        "ollama_model": OLLAMA_MODEL,
+        "whisper_model": WHISPER_MODEL,
+        "version": "1.2.0",
+        "time": _now().isoformat(),
+    }
 
 
 @app.get("/dashboard", response_class=HTMLResponse, dependencies=[Depends(_require_admin_session)])

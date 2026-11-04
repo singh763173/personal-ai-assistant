@@ -264,13 +264,10 @@ class BeeDeviceWhisplay:
             return None
 
     def _check_backend_online(self, timeout: float = 5.0) -> bool:
-        """Return True if the configured backend is reachable."""
+        """Return True if the configured backend /health endpoint responds."""
         try:
-            headers = {}
-            if API_KEY:
-                headers["Authorization"] = API_KEY
-            r = requests.get(f"{BACKEND_URL}/api/v1/metrics", headers=headers, timeout=timeout)
-            return r.status_code == 200
+            r = requests.get(f"{BACKEND_URL}/api/v1/health", timeout=timeout)
+            return r.status_code == 200 and r.json().get("status") == "ok"
         except Exception:
             return False
 
