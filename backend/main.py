@@ -88,8 +88,10 @@ class Conversation(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     transcript = Column(Text)
     summary = Column(Text, nullable=True)
+    reply = Column(Text, nullable=True)
     todos = Column(Text, nullable=True)
     raw_llm_response = Column(Text, nullable=True)
+    image_path = Column(Text, nullable=True)
 
 
 class Device(Base):
