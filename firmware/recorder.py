@@ -306,7 +306,7 @@ class BeeDeviceWhisplay:
     def _capture_and_upload(self):
         img_path = self._capture_image()
         if img_path:
-            self.last_camera_ok = self._upload_file("/upload-image", "image", img_path)
+            self.last_camera_ok = self._upload_file("/api/v1/upload-image", "image", img_path)
             self._cleanup(img_path)
 
     def _cleanup(self, path: Path):
@@ -334,7 +334,7 @@ class BeeDeviceWhisplay:
 
                 self._update_display()
                 wav_path = self._record_chunk(CHUNK_SECONDS)
-                self.last_upload_ok = self._upload_file("/upload", "audio", wav_path)
+                self.last_upload_ok = self._upload_file("/api/v1/upload", "audio", wav_path)
                 self._cleanup(wav_path)
 
                 if ENABLE_CAMERA and (time.time() - last_camera_time) > CAMERA_INTERVAL:
