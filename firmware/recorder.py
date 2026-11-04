@@ -50,6 +50,8 @@ AUDIO_CHANNELS = int(os.getenv("BEE_AUDIO_CHANNELS", "2"))
 AUDIO_CARD = os.getenv("BEE_AUDIO_CARD", "whisplaysound")
 ENABLE_CAMERA = os.getenv("BEE_ENABLE_CAMERA", "true").lower() in ("1", "true", "yes")
 CAMERA_INTERVAL = int(os.getenv("BEE_CAMERA_INTERVAL", "300"))
+# Set BEE_AUTO_CAMERA_INTERVAL (seconds) to enable periodic snapshots while muted.
+AUTO_CAMERA_INTERVAL = int(os.getenv("BEE_AUTO_CAMERA_INTERVAL", "0"))
 LONG_PRESS_SECONDS = float(os.getenv("BEE_LONG_PRESS_SECONDS", "2.0"))
 PISUGAR_API = os.getenv("BEE_PISUGAR_API", "http://localhost:8423")
 
@@ -489,8 +491,8 @@ class BeeDeviceWhisplay:
         try:
             while True:
                 time.sleep(0.5)
-                # Periodic camera photo while muted
-                if self.muted and ENABLE_CAMERA and (time.time() - last_camera_time) > CAMERA_INTERVAL:
+                # Periodic camera photo while muted (disabled by default; set BEE_AUTO_CAMERA_INTERVAL)
+                if AUTO_CAMERA_INTERVAL > 0 and self.muted and ENABLE_CAMERA and (time.time() - last_camera_time) > AUTO_CAMERA_INTERVAL:
                     self._capture_and_upload()
                     last_camera_time = time.time()
                     self._update_display()
