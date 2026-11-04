@@ -285,13 +285,15 @@ class BeeDeviceWhisplay:
         # Wait for one-shot GIF to finish roughly, then go dashboard
         threading.Thread(target=self._return_home_then_dashboard, daemon=True).start()
 
-    def _set_rgb(self, color):
+    def _set_rgb(self, *color):
         if self.board:
             try:
-                if isinstance(color, tuple):
+                if len(color) == 1 and isinstance(color[0], tuple):
+                    self.board.set_rgb(*color[0])
+                elif len(color) == 3:
                     self.board.set_rgb(*color)
                 else:
-                    self.board.set_rgb(color)
+                    self.board.set_rgb(*color)
             except Exception as e:
                 print(f"LED set failed: {e}")
 
