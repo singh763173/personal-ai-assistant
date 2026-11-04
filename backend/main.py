@@ -10,13 +10,16 @@ import os
 import json
 import secrets
 import hashlib
+import base64
+import subprocess
+import asyncio
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
 import requests
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Depends, Request, status, Response
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -50,6 +53,7 @@ security = HTTPBearer(auto_error=False)
 # Config
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "kimi-k2.7-code:cloud")
+OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava:7b")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
@@ -111,8 +115,10 @@ print("Whisper loaded.")
 class UploadResponse(BaseModel):
     conversation_id: int
     transcript: str
-    summary: Optional[str]
+    summary: Optional[str] = None
+    reply: Optional[str] = None
     todos: List[str]
+    audio_url: Optional[str] = None
 
 
 class OnboardRequest(BaseModel):
@@ -225,6 +231,7 @@ def transcribe(path: Path) -> str:
 
 
 def ask_ollama(transcript: str) -> dict:
+    """Legacy summary/to-do extraction. Kept for /api/v1/upload compatibility."""
     prompt = f"""You are a helpful personal AI assistant reviewing an audio transcript captured from the user's day.
 Transcript:
 {transcript}
@@ -258,7 +265,6 @@ Respond ONLY as valid JSON with this exact structure:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            # Some cloud models return markdown fences around JSON
             cleaned = raw.strip()
             if cleaned.startswith("```"):
                 cleaned = cleaned.strip("`").strip()
@@ -273,6 +279,69 @@ Respond ONLY as valid JSON with this exact structure:
         }
     except Exception as e:
         return {"summary": f"LLM error: {e}", "todos": [], "type": "error", "raw": str(e)}
+
+
+def ask_llm(transcript: str) -> str:
+    """Send transcript to a conversational LLM and return a spoken reply."""
+    now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC on %A, %d %B %Y")
+    prompt = f"""You are a helpful voice assistant in a wearable device. The user just spoke to you.
+Current date and time: {now}.
+
+User: {transcript}
+
+Reply as if speaking aloud. Keep it concise (1-3 sentences), friendly, and clear. Do not include markdown or lists."""
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.7, "num_ctx": 4096},
+    }
+    try:
+        r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=120)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("response", "").strip()
+    except Exception as e:
+        return f"Sorry, I couldn't get a response right now. Error: {e}"
+
+
+def ask_vision_llm(transcript: str, image_base64: str) -> str:
+    """Send image + transcript to a vision model and return a spoken reply."""
+    now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC on %A, %d %B %Y")
+    prompt = f"""You are a helpful voice assistant in a wearable camera. The user took a photo and asked you about it.
+Current date and time: {now}.
+
+User question: {transcript}
+
+Describe what you see in the image and answer the question. Reply as if speaking aloud. Keep it concise (2-4 sentences), clear, and friendly."""
+
+    payload = {
+        "model": OLLAMA_VISION_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "images": [image_base64],
+        "options": {"temperature": 0.7, "num_ctx": 4096},
+    }
+    try:
+        r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=180)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("response", "").strip()
+    except Exception as e:
+        return f"Sorry, I couldn't analyze the image right now. Error: {e}"
+
+
+async def text_to_speech(text: str, out_path: Path) -> bool:
+    """Generate MP3 from text using edge-tts. Returns True on success."""
+    try:
+        import edge_tts
+        communicate = edge_tts.Communicate(text, "en-GB-SoniaNeural")
+        await communicate.save(str(out_path))
+        return out_path.exists() and out_path.stat().st_size > 0
+    except Exception as e:
+        print(f"TTS failed: {e}")
+        return False
 
 
 @app.middleware("http")
@@ -455,6 +524,101 @@ async def upload_audio(
         wav_path.unlink(missing_ok=True)
 
 
+@app.post("/api/v1/ask", response_model=UploadResponse)
+async def ask_endpoint(
+    request: Request,
+    audio: UploadFile = File(...),
+    image: Optional[UploadFile] = File(None),
+    device_id: str = Form("unknown"),
+    device: Device = Depends(_rate_limit),
+):
+    """Voice (and optional vision) Q&A endpoint. Returns transcript + spoken reply + audio URL."""
+    if not audio.filename.endswith(".wav"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .wav files supported")
+
+    audio_body = await audio.read()
+    if len(audio_body) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Max upload size is {MAX_UPLOAD_BYTES} bytes")
+
+    tmp_dir = Path("/tmp/bee-uploads")
+    tmp_dir.mkdir(exist_ok=True)
+    wav_path = tmp_dir / f"{_now().isoformat()}-{audio.filename}"
+    image_path = None
+    image_b64 = None
+
+    with open(wav_path, "wb") as f:
+        f.write(audio_body)
+
+    try:
+        if image and image.filename:
+            img_ext = Path(image.filename).suffix.lower()
+            if img_ext not in (".jpg", ".jpeg", ".png"):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .jpg/.jpeg/.png images supported")
+            img_body = await image.read()
+            if len(img_body) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"Max image size is {MAX_UPLOAD_BYTES} bytes")
+            image_path = tmp_dir / f"{_now().isoformat()}-{image.filename}"
+            with open(image_path, "wb") as f:
+                f.write(img_body)
+            image_b64 = base64.b64encode(img_body).decode("utf-8")
+
+        transcript = transcribe(wav_path)
+
+        if image_b64:
+            reply = ask_vision_llm(transcript, image_b64)
+        else:
+            reply = ask_llm(transcript)
+
+        # Generate spoken reply
+        audio_dir = Path(__file__).parent / "audio_replies"
+        audio_dir.mkdir(exist_ok=True)
+        mp3_path = audio_dir / f"{_now().strftime('%Y%m%d-%H%M%S-%f')}-{device_id}.mp3"
+        tts_ok = await text_to_speech(reply, mp3_path)
+
+        db = next(get_db())
+        conv = Conversation(
+            device_id=device_id,
+            transcript=transcript,
+            summary="",
+            reply=reply,
+            todos=json.dumps([]),
+            raw_llm_response=reply,
+            image_path=str(image_path) if image_path else None,
+        )
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+        db.close()
+
+        # Rename MP3 to use conversation id for easy serving
+        final_mp3_path = audio_dir / f"{conv.id}.mp3"
+        if tts_ok:
+            mp3_path.rename(final_mp3_path)
+        else:
+            final_mp3_path = None
+
+        audio_url = f"/api/v1/audio/{conv.id}.mp3" if final_mp3_path and final_mp3_path.exists() else None
+
+        return UploadResponse(
+            conversation_id=conv.id,
+            transcript=transcript,
+            summary="",
+            reply=reply,
+            todos=[],
+            audio_url=audio_url,
+        )
+    finally:
+        wav_path.unlink(missing_ok=True)
+
+
+@app.get("/api/v1/audio/{conversation_id}.mp3")
+async def get_audio_reply(conversation_id: int):
+    audio_path = Path(__file__).parent / "audio_replies" / f"{conversation_id}.mp3"
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Audio reply not found")
+    return FileResponse(audio_path, media_type="audio/mpeg", filename=f"reply-{conversation_id}.mp3")
+
+
 @app.get("/api/v1/conversations", dependencies=[Depends(_require_admin_session)])
 async def list_conversations(limit: int = 50, device_id: Optional[str] = None, db: SessionLocal = Depends(get_db)):
     query = db.query(Conversation)
@@ -469,6 +633,8 @@ async def list_conversations(limit: int = 50, device_id: Optional[str] = None, d
             "created_at": r.created_at.isoformat(),
             "transcript": r.transcript,
             "summary": r.summary,
+            "reply": r.reply,
+            "audio_url": f"/api/v1/audio/{r.id}.mp3" if r.reply else None,
             "todos": json.loads(r.todos or "[]"),
         }
         for r in rows

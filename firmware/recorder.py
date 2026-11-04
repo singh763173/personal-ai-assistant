@@ -187,10 +187,19 @@ class BeeDeviceWhisplay:
             self._start_recording()
 
     def _on_double_click(self):
-        print(f"[{datetime.now(timezone.utc).isoformat()}] Double click: capture photo")
-        self._draw_status("Capturing...", COLOR_ORANGE)
-        self._capture_and_upload()
-        self._update_display()
+        print(f"[{datetime.now(timezone.utc).isoformat()}] Double click: capture photo + ask")
+        self._draw_status("Look at camera...", COLOR_ORANGE)
+        # Capture photo and immediately take a 5-second question recording
+        img_path = self._capture_image()
+        if not img_path:
+            return
+        # Record 5s question
+        q_wav = self._start_recording()
+        time.sleep(5)
+        self._draw_status("Processing...", COLOR_ORANGE)
+        self._upload_ask_with_image(img_path, self._stop_recording())
+        self._cleanup(q_wav)
+        self._cleanup(img_path)
 
     def _on_long_press(self):
         print(f"[{datetime.now(timezone.utc).isoformat()}] Long press: shutting down")
@@ -316,28 +325,36 @@ class BeeDeviceWhisplay:
             print(f"Camera capture failed: {e}")
             return None
 
-    def _upload_file(self, url_path: str, field_name: str, file_path: Path) -> bool:
+    def _upload_ask(self, url_path: str, wav_path: Path) -> bool:
         url = f"{BACKEND_URL}{url_path}"
         try:
-            with open(file_path, "rb") as f:
-                files = {field_name: (file_path.name, f, "audio/wav" if file_path.suffix == ".wav" else "image/jpeg")}
+            with open(wav_path, "rb") as f:
+                files = {"audio": (wav_path.name, f, "audio/wav")}
                 data = {"device_id": DEVICE_ID}
                 if API_KEY:
                     headers = {"Authorization": API_KEY}
                 else:
                     headers = {}
-                resp = self.session.post(url, files=files, data=data, headers=headers, timeout=60)
+                resp = self.session.post(url, files=files, data=data, headers=headers, timeout=120)
                 resp.raise_for_status()
-                print(f"Upload OK: {resp.status_code}")
+                result = resp.json()
+                reply = result.get("reply", "")
+                audio_url = result.get("audio_url")
+                print(f"[LLM] reply: {reply}")
+                self.last_upload_ok = True
+                if reply:
+                    self._show_reply(reply)
+                    self._play_reply_audio(audio_url)
                 return True
         except Exception as e:
-            print(f"Upload failed: {e}")
+            print(f"Upload/ask failed: {e}")
+            self.last_upload_ok = False
             return False
 
     def _upload_last_recording(self):
         wav_path = self._stop_recording()
         if wav_path and wav_path.exists():
-            self.last_upload_ok = self._upload_file("/api/v1/upload", "audio", wav_path)
+            self._upload_ask("/api/v1/ask", wav_path)
             self._cleanup(wav_path)
         else:
             print("[REC] No recording to upload")
@@ -348,6 +365,59 @@ class BeeDeviceWhisplay:
         if img_path:
             self.last_camera_ok = self._upload_file("/api/v1/upload-image", "image", img_path)
             self._cleanup(img_path)
+
+    def _show_reply(self, text: str):
+        if not self.board or not HAS_PIL:
+            return
+        try:
+            self.current_reply = text
+            img = Image.new("RGB", (240, 280), COLOR_BLACK)
+            draw = ImageDraw.Draw(img)
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
+                small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+            except Exception:
+                font = ImageFont.load_default()
+                small = font
+            draw.text((10, 10), "Bee reply", font=font, fill=COLOR_GREEN)
+            # Wrap text roughly
+            lines = []
+            words = text.split()
+            line = ""
+            for word in words:
+                if len(line) + len(word) + 1 < 28:
+                    line += " " + word if line else word
+                else:
+                    lines.append(line)
+                    line = word
+            if line:
+                lines.append(line)
+            y = 50
+            for line in lines[:12]:
+                draw.text((10, y), line, font=font, fill=COLOR_WHITE)
+                y += 22
+            draw.text((10, 260), "[click to talk again]", font=small, fill=COLOR_YELLOW)
+            self.board.draw_image(0, 0, 240, 280, rgb565_bytes(img))
+        except Exception as e:
+            print(f"Reply display failed: {e}")
+
+    def _play_reply_audio(self, audio_url: str):
+        if not audio_url:
+            return
+        try:
+            url = f"{BACKEND_URL}{audio_url}"
+            r = self.session.get(url, timeout=30)
+            r.raise_for_status()
+            mp3_path = Path(tempfile.gettempdir()) / "bee-device" / "reply.mp3"
+            mp3_path.parent.mkdir(exist_ok=True)
+            with open(mp3_path, "wb") as f:
+                f.write(r.content)
+            # Play via aplay if available, otherwise ffplay
+            player = ["aplay", "-D", f"hw:{AUDIO_CARD}", str(mp3_path)]
+            subprocess.run(player, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            print(f"[AUDIO] Played reply")
+        except Exception as e:
+            print(f"Audio play failed: {e}")
 
     def _cleanup(self, path: Path):
         try:
