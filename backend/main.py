@@ -643,7 +643,7 @@ async def list_conversations(limit: int = 50, device_id: Optional[str] = None, d
     ]
 
 
-@app.post("/api/v1/upload-image", response_model=AskResponse)
+@app.post("/api/v1/upload-image", response_model=UploadResponse)
 async def upload_image(
     request: Request,
     image: UploadFile = File(...),
@@ -686,7 +686,7 @@ async def upload_image(
     # Generate TTS audio
     audio_rel_path = await _generate_tts(conv.id, reply)
 
-    return AskResponse(
+    return UploadResponse(
         conversation_id=conv.id,
         transcript=transcript,
         summary="",
