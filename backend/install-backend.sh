@@ -31,6 +31,7 @@ OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-kimi-k2.7-code:cloud}"
 OLLAMA_VISION_MODEL="${OLLAMA_VISION_MODEL:-moondream:latest}"
 WHISPER_URL="${WHISPER_URL:-http://192.168.1.86:8001/transcribe}"
+TTS_PROVIDER="${TTS_PROVIDER:-piper}"
 WHISPER_API_KEY="${WHISPER_API_KEY:-}"
 WHISPER_MODEL="${WHISPER_MODEL:-base}"
 BEE_ADMIN_USERNAME="${BEE_ADMIN_USERNAME:-admin}"
@@ -137,6 +138,19 @@ pip install --upgrade pip
 pip install -r "$BACKEND_DIR/requirements.txt"
 
 # ---------------------------------------------------------------------------
+# 4b. Download Piper TTS voice model (optional)
+# ---------------------------------------------------------------------------
+if [[ "$TTS_PROVIDER" == "piper" ]]; then
+    log_step "Downloading Piper TTS voice model..."
+    mkdir -p "$BACKEND_DIR/voices"
+    PIPER_BASE="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/amy/medium"
+    if [[ ! -f "$BACKEND_DIR/voices/en_US-amy-medium.onnx" ]]; then
+        curl -fsSL "$PIPER_BASE/en_US-amy-medium.onnx" -o "$BACKEND_DIR/voices/en_US-amy-medium.onnx"
+        curl -fsSL "$PIPER_BASE/en_US-amy-medium.onnx.json" -o "$BACKEND_DIR/voices/en_US-amy-medium.onnx.json"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # 5. Configure environment file
 # ---------------------------------------------------------------------------
 log_step "Writing backend environment configuration..."
@@ -148,6 +162,8 @@ OLLAMA_VISION_MODEL=$OLLAMA_VISION_MODEL
 WHISPER_URL=${WHISPER_URL:-http://192.168.1.86:8001/transcribe}
 WHISPER_API_KEY=$WHISPER_API_KEY
 WHISPER_MODEL=$WHISPER_MODEL
+TTS_PROVIDER=$TTS_PROVIDER
+PIPER_VOICE_MODEL=$BACKEND_DIR/voices/en_US-amy-medium.onnx
 WHISPER_DEVICE=cpu
 WHISPER_COMPUTE_TYPE=int8
 BEE_ADMIN_USERNAME=$BEE_ADMIN_USERNAME

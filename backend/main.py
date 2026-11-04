@@ -62,6 +62,11 @@ WHISPER_URL = os.getenv("WHISPER_URL", "")  # e.g. http://192.168.1.86:8001/tran
 WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "")
 WHISPER_LOCAL = not WHISPER_URL
 
+# TTS config
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "edge").lower()
+PIPER_VOICE_MODEL = os.getenv("PIPER_VOICE_MODEL", "/opt/bee-backend/voices/en_US-amy-medium.onnx")
+
+
 ADMIN_USERNAME = os.getenv("BEE_ADMIN_USERNAME", "")
 ADMIN_PASSWORD_HASH = os.getenv("BEE_ADMIN_PASSWORD_HASH", "")
 SECRET_KEY = os.getenv("BEE_SECRET_KEY", "")
@@ -400,13 +405,35 @@ Describe what you see in the image and answer the question. Reply as if speaking
 
 @_retry_async(max_attempts=3, delay=0.5, backoff=2.0, exceptions=(Exception,))
 async def text_to_speech(text: str, out_path: Path) -> bool:
-    """Generate MP3 from text using edge-tts. Returns True on success."""
+    """Generate audio from text. Supports edge-tts (MP3) and piper-tts (WAV)."""
     try:
-        import edge_tts
+        if TTS_PROVIDER == "piper":
+            import io
+            import wave
+            import subprocess as sp
+            from piper import PiperVoice
 
-        communicate = edge_tts.Communicate(text, "en-GB-SoniaNeural")
-        await communicate.save(str(out_path))
-        return out_path.exists() and out_path.stat().st_size > 0
+            voice = PiperVoice.load(PIPER_VOICE_MODEL)
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as w:
+                voice.synthesize_wav(text, w)
+            wav_bytes = buf.getvalue()
+            tmp_wav = out_path.with_suffix(".wav")
+            tmp_wav.write_bytes(wav_bytes)
+            sp.run(
+                ["ffmpeg", "-y", "-i", str(tmp_wav), "-b:a", "64k", str(out_path)],
+                stdout=sp.DEVNULL,
+                stderr=sp.DEVNULL,
+                check=True,
+            )
+            tmp_wav.unlink(missing_ok=True)
+            return out_path.exists() and out_path.stat().st_size > 0
+        else:
+            import edge_tts
+
+            communicate = edge_tts.Communicate(text, "en-GB-SoniaNeural")
+            await communicate.save(str(out_path))
+            return out_path.exists() and out_path.stat().st_size > 0
     except Exception as e:
         print(f"TTS failed: {e}")
         return False
