@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import time
 from datetime import UTC, datetime, timedelta
@@ -275,13 +276,39 @@ def _clean_search_query(transcript: str) -> tuple[str, bool]:
     query = lowered.strip(",.?!")
     if not query:
         query = "latest news today"
-    # Detect news intent
-    news_words = {"news", "headlines", "breaking", "updates", "today"}
-    use_news = any(w in query for w in news_words) and not any(w in query for w in {"weather", "stock", "price", "score", "forecast"})
-    # Append today's date for freshness on news queries
-    if use_news and "today" not in query:
-        today = datetime.now(UTC).strftime("%d %B %Y")
-        query = f"{query} today {today}"
+
+    # Determine intent
+    is_weather = "weather" in query or "forecast" in query or "temperature" in query
+    is_news = any(w in query for w in {"news", "headlines", "breaking", "updates"})
+
+    # Substitute location from context when the user refers to their location
+    if BEE_USER_CONTEXT:
+        ctx_lower = BEE_USER_CONTEXT.lower()
+        if any(pronoun in query for pronoun in {"where i am", "my location", "my area", "near me", "here"}):
+            # Try to extract a place from context, e.g. "London, UK"
+            match = re.search(r"(in|based in|from|near|lives in)\s+([a-zA-Z\s,]+)", BEE_USER_CONTEXT)
+            if match:
+                place = match.group(2).strip().strip(",.!?")
+                query = re.sub(r"(where i am|my location|my area|near me|here)", place, query)
+            else:
+                # Append context as a fallback
+                query = f"{query} {BEE_USER_CONTEXT}"
+        if is_weather and "london" not in query and "uk" not in query and "london" in ctx_lower:
+            # If we know they are in London, append it for weather queries
+            query = f"{query} London"
+
+    if is_weather:
+        # Weather queries need a place and date for useful results
+        if "today" not in query and "now" not in query and "forecast" not in query:
+            query = f"{query} today"
+        use_news = False
+    else:
+        # Detect news intent
+        use_news = is_news and not any(w in query for w in {"weather", "stock", "price", "score", "forecast"})
+        # Append today's date for freshness on news queries
+        if use_news and "today" not in query:
+            today = datetime.now(UTC).strftime("%d %B %Y")
+            query = f"{query} today {today}"
     return query[:240], use_news
 
 
