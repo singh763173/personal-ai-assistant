@@ -19,6 +19,7 @@ from pathlib import Path
 
 import bcrypt
 import requests
+from ddgs import DDGS
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -65,6 +66,16 @@ WHISPER_LOCAL = not WHISPER_URL
 # TTS config
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "edge").lower()
 PIPER_VOICE_MODEL = os.getenv("PIPER_VOICE_MODEL", "/opt/bee-backend/voices/en_US-amy-medium.onnx")
+
+# Web search config
+ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "true").lower() in ("1", "true", "yes", "on")
+WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
+LIVE_QUERY_KEYWORDS = [
+    "latest", "news", "today", "current", "weather", "now", "live",
+    "recent", "update", "headlines", "this week", "this month", "score",
+    "stock price", "market", "who won", "election", "breaking", "forecast",
+]
 
 
 ADMIN_USERNAME = os.getenv("BEE_ADMIN_USERNAME", "")
@@ -117,6 +128,181 @@ def _retry_async(max_attempts: int = 3, delay: float = 0.5, backoff: float = 2.0
         return wrapper
 
     return decorator
+
+
+def _needs_live_info(text: str) -> bool:
+    """Heuristic: does the user appear to be asking for current/real-time data?"""
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(kw in lowered for kw in LIVE_QUERY_KEYWORDS)
+
+
+@_retry(max_attempts=2, delay=0.5, backoff=2.0, exceptions=(Exception,))
+def ollama_web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> list[dict]:
+    """Search the web using Ollama's web_search API (requires OLLAMA_API_KEY)."""
+    if not OLLAMA_API_KEY:
+        return []
+    try:
+        r = requests.post(
+            "https://ollama.com/api/web_search",
+            headers={"Authorization": f"Bearer {OLLAMA_API_KEY}", "Content-Type": "application/json"},
+            json={"query": query, "max_results": max_results},
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+        out = []
+        for item in data.get("results", []):
+            out.append({
+                "title": item.get("title", ""),
+                "href": item.get("url", ""),
+                "body": item.get("content", "")[:600],
+            })
+        return out
+    except Exception as e:
+        print(f"[ollama_web_search] failed: {e}")
+        return []
+
+
+@_retry(max_attempts=2, delay=0.5, backoff=2.0, exceptions=(Exception,))
+def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS, use_news: bool = False) -> list[dict]:
+    """Search the web. Prefer Ollama's API if an API key is set, otherwise fall back to DuckDuckGo."""
+    if OLLAMA_API_KEY:
+        results = ollama_web_search(query, max_results=max_results)
+        if results:
+            return results
+    results: list[dict] = []
+    try:
+        with DDGS() as ddgs:
+            if use_news:
+                for result in ddgs.news(query, max_results=max_results, region="uk-en"):
+                    results.append({
+                        "title": result.get("title", ""),
+                        "href": result.get("url", ""),
+                        "body": result.get("body", ""),
+                        "date": result.get("date", ""),
+                        "source": result.get("source", ""),
+                    })
+            else:
+                for result in ddgs.text(query, max_results=max_results, region="uk-en"):
+                    results.append({
+                        "title": result.get("title", ""),
+                        "href": result.get("href", ""),
+                        "body": result.get("body", ""),
+                    })
+    except Exception as e:
+        print(f"[web_search] failed: {e}")
+        return []
+    # Drop empty or ad/redirect results
+    filtered = []
+    for r in results:
+        href = r.get("href", "")
+        title = r.get("title", "")
+        if not href or not title:
+            continue
+        if "bing.com/aclick" in href or href.startswith("https://www.bing.com/aclick"):
+            continue
+        filtered.append(r)
+    return filtered
+
+
+@_retry(max_attempts=2, delay=0.5, backoff=2.0, exceptions=(Exception,))
+def web_fetch(url: str) -> str:
+    """Fetch a page and return a plain-text excerpt."""
+    if not url:
+        return ""
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        # Very naive text extraction
+        text = r.text
+        # Strip script/style tags crudely
+        import re
+        text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:3000]
+    except Exception as e:
+        print(f"[web_fetch] failed for {url}: {e}")
+        return ""
+
+
+def _format_search_results(results: list[dict]) -> str:
+    if not results:
+        return "No web search results were found."
+    lines = ["Web search results:"]
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "")
+        href = r.get("href", "")
+        body = r.get("body", "")[:400]
+        lines.append(f"{i}. {title}\n   URL: {href}\n   Snippet: {body}")
+    return "\n\n".join(lines)
+
+
+def _clean_search_query(transcript: str) -> tuple[str, bool]:
+    """Turn a spoken request into a concise web-search query.
+
+    Returns (query, use_news).
+    """
+    lowered = transcript.lower().strip(".?!")
+    # Remove common voice-assistant filler phrases iteratively
+    fillers = [
+        "tell me", "what is", "what's", "whats", "give me", "find",
+        "search for", "look up", "can you tell me", "could you tell me",
+        "i want to know", "do you know", "is there", "are there",
+        "the latest", "latest", "about", "some", "any", "current",
+    ]
+    for phrase in fillers:
+        if lowered.startswith(phrase + " "):
+            lowered = lowered[len(phrase):].strip()
+            # Continue stripping if another filler remains
+            break
+    # Clean up stray punctuation
+    query = lowered.strip(",.?!")
+    if not query:
+        query = "latest news today"
+    # Detect news intent
+    news_words = {"news", "headlines", "breaking", "updates", "today"}
+    use_news = any(w in query for w in news_words) and not any(w in query for w in {"weather", "stock", "price", "score", "forecast"})
+    # Append today's date for freshness on news queries
+    if use_news and "today" not in query:
+        today = datetime.now(UTC).strftime("%d %B %Y")
+        query = f"{query} today {today}"
+    return query[:240], use_news
+
+
+def _augment_prompt_for_live_info(base_prompt: str, transcript: str) -> tuple[str, list[dict]]:
+    """If the query looks time-sensitive, run a web search and prepend results."""
+    if not ENABLE_WEB_SEARCH or not _needs_live_info(transcript):
+        return base_prompt, []
+    query, use_news = _clean_search_query(transcript)
+    print(f"[live_info] web search triggered for: {transcript!r} (query: {query!r}, news={use_news})")
+    results = web_search(query, use_news=use_news)
+    if not results:
+        return base_prompt, []
+    # Enrich top result with a full fetch
+    for r in results[:1]:
+        href = r.get("href", "")
+        if not href:
+            continue
+        page = web_fetch(href)
+        if page:
+            r["page_excerpt"] = page[:1500]
+    formatted = _format_search_results(results)
+    augmented = f"""{formatted}
+
+Use the web search results above to answer the user's question. If the results are insufficient, say so. Do not make up facts.
+
+{base_prompt}"""
+    return augmented, results
 
 
 # Security
@@ -354,13 +540,14 @@ Respond ONLY as valid JSON with this exact structure:
 def ask_llm(transcript: str) -> str:
     """Send transcript to a conversational LLM and return a spoken reply."""
     now = datetime.now(UTC).strftime("%H:%M:%S UTC on %A, %d %B %Y")
-    prompt = f"""You are a helpful voice assistant in a wearable device. The user just spoke to you.
+    base_prompt = f"""You are a helpful voice assistant in a wearable device. The user just spoke to you.
 Current date and time: {now}.
 
-User: {transcript}
+User's message:
+{transcript}
 
-Reply as if speaking aloud. Keep it concise (1-3 sentences), friendly, and clear. Do not include markdown or lists."""
-
+Give a concise, natural-sounding spoken reply."""
+    prompt, _ = _augment_prompt_for_live_info(base_prompt, transcript)
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
@@ -380,13 +567,13 @@ Reply as if speaking aloud. Keep it concise (1-3 sentences), friendly, and clear
 def ask_vision_llm(transcript: str, image_base64: str) -> str:
     """Send image + transcript to a vision model and return a spoken reply."""
     now = datetime.now(UTC).strftime("%H:%M:%S UTC on %A, %d %B %Y")
-    prompt = f"""You are a helpful voice assistant in a wearable camera. The user took a photo and asked you about it.
+    base_prompt = f"""You are a helpful voice assistant in a wearable camera. The user took a photo and asked you about it.
 Current date and time: {now}.
 
 User question: {transcript}
 
 Describe what you see in the image and answer the question. Reply as if speaking aloud. Keep it concise (2-4 sentences), clear, and friendly."""
-
+    prompt, _ = _augment_prompt_for_live_info(base_prompt, transcript)
     payload = {
         "model": OLLAMA_VISION_MODEL,
         "prompt": prompt,
