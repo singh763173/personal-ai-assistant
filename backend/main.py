@@ -67,6 +67,12 @@ WHISPER_LOCAL = not WHISPER_URL
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "edge").lower()
 PIPER_VOICE_MODEL = os.getenv("PIPER_VOICE_MODEL", "/opt/bee-backend/voices/en_US-amy-medium.onnx")
 
+# User context for LLM replies
+BEE_USER_CONTEXT = os.getenv("BEE_USER_CONTEXT", "").strip()
+
+# Voice config
+BEE_VOICE = os.getenv("BEE_VOICE", "en-GB-SoniaNeural")
+
 # Web search config
 ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "true").lower() in ("1", "true", "yes", "on")
 WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
@@ -540,13 +546,14 @@ Respond ONLY as valid JSON with this exact structure:
 def ask_llm(transcript: str) -> str:
     """Send transcript to a conversational LLM and return a spoken reply."""
     now = datetime.now(UTC).strftime("%H:%M:%S UTC on %A, %d %B %Y")
+    context_line = f"\nUser context: {BEE_USER_CONTEXT}" if BEE_USER_CONTEXT else ""
     base_prompt = f"""You are a helpful voice assistant in a wearable device. The user just spoke to you.
-Current date and time: {now}.
+Current date and time: {now}.{context_line}
 
 User's message:
 {transcript}
 
-Give a concise, natural-sounding spoken reply."""
+Give a concise, natural-sounding spoken reply. Use British English spelling and phrasing where natural."""
     prompt, _ = _augment_prompt_for_live_info(base_prompt, transcript)
     payload = {
         "model": OLLAMA_MODEL,
@@ -567,12 +574,13 @@ Give a concise, natural-sounding spoken reply."""
 def ask_vision_llm(transcript: str, image_base64: str) -> str:
     """Send image + transcript to a vision model and return a spoken reply."""
     now = datetime.now(UTC).strftime("%H:%M:%S UTC on %A, %d %B %Y")
+    context_line = f"\nUser context: {BEE_USER_CONTEXT}" if BEE_USER_CONTEXT else ""
     base_prompt = f"""You are a helpful voice assistant in a wearable camera. The user took a photo and asked you about it.
-Current date and time: {now}.
+Current date and time: {now}.{context_line}
 
 User question: {transcript}
 
-Describe what you see in the image and answer the question. Reply as if speaking aloud. Keep it concise (2-4 sentences), clear, and friendly."""
+Describe what you see in the image and answer the question. Reply as if speaking aloud. Keep it concise (2-4 sentences), clear, and friendly. Use British English spelling and phrasing where natural."""
     prompt, _ = _augment_prompt_for_live_info(base_prompt, transcript)
     payload = {
         "model": OLLAMA_VISION_MODEL,
@@ -638,7 +646,7 @@ async def text_to_speech(text: str, out_path: Path) -> bool:
         else:
             import edge_tts
 
-            communicate = edge_tts.Communicate(text, "en-GB-SoniaNeural")
+            communicate = edge_tts.Communicate(text, BEE_VOICE)
             await communicate.save(str(out_path))
             return out_path.exists() and out_path.stat().st_size > 0
     except Exception as e:
