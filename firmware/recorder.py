@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import requests
+import socket
 
 # Wi-Fi management
 try:
@@ -75,7 +76,8 @@ AUDIO_CHANNELS = int(os.getenv("BEE_AUDIO_CHANNELS", "2"))
 AUDIO_CARD = os.getenv("BEE_AUDIO_CARD", "whisplaysound")
 ENABLE_CAMERA = os.getenv("BEE_ENABLE_CAMERA", "true").lower() in ("1", "true", "yes")
 LONG_PRESS_SECONDS = float(os.getenv("BEE_LONG_PRESS_SECONDS", "2.0"))
-PISUGAR_API = os.getenv("BEE_PISUGAR_API", "http://localhost:8423")
+PISUGAR_HOST = os.getenv("BEE_PISUGAR_HOST", "127.0.0.1")
+PISUGAR_PORT = int(os.getenv("BEE_PISUGAR_PORT", "8423"))
 
 SILENCE_TIMEOUT_SECONDS = float(os.getenv("BEE_SILENCE_TIMEOUT", "3.0"))
 MAX_RECORD_SECONDS = float(os.getenv("BEE_MAX_RECORD_SECONDS", "15.0"))
@@ -260,14 +262,57 @@ class BeeDeviceWhisplay:
             except Exception as e:
                 print(f"LCD draw failed: {e}")
 
-    def _get_battery(self):
+    def _pisugar_cmd(self, cmd: str, timeout: float = 1.0) -> str:
+        """Send a raw command to the PiSugar TCP server and return the first line of response."""
         try:
-            r = self.session.get(f"{PISUGAR_API}/api/power", timeout=3)
-            r.raise_for_status()
-            data = r.json()
-            return data.get("battery_percentage") or data.get("battery") or data.get("level")
+            with socket.create_connection((PISUGAR_HOST, PISUGAR_PORT), timeout=timeout) as sock:
+                sock.sendall(f"{cmd}\n".encode())
+                sock.shutdown(socket.SHUT_WR)
+                response = b""
+                while True:
+                    chunk = sock.recv(256)
+                    if not chunk:
+                        break
+                    response += chunk
+                    if b"\n" in response:
+                        break
+                return response.decode("utf-8", errors="ignore").strip()
+        except Exception as e:
+            return ""
+
+    def _get_battery(self):
+        now = time.time()
+        # Cache for 5 seconds so we don't hammer I2C on every animation frame
+        if now - getattr(self, "_battery_cache_time", 0) < 5.0:
+            return getattr(self, "_battery_cache_value", None)
+        try:
+            line = self._pisugar_cmd("get battery")
+            if line.startswith("battery:"):
+                value = float(line.split(":", 1)[1].strip())
+                self._battery_cache_value = value
+                self._battery_cache_time = now
+                return value
+        except Exception as e:
+            print(f"Battery read failed: {e}")
+        return None
+
+    def _pisugar_plugged(self) -> bool:
+        try:
+            line = self._pisugar_cmd("get battery_power_plugged")
+            if line.startswith("battery_power_plugged:"):
+                return line.split(":", 1)[1].strip().lower() == "true"
         except Exception:
-            return None
+            pass
+        return False
+
+    def _pisugar_charging(self) -> bool:
+        try:
+            line = self._pisugar_cmd("get battery_charging")
+            if line.startswith("battery_charging:"):
+                return line.split(":", 1)[1].strip().lower() == "true"
+        except Exception:
+            pass
+        return False
 
     def _check_backend_online(self, timeout: float = 5.0) -> bool:
         """Return True if the configured backend /health endpoint responds."""
@@ -284,6 +329,11 @@ class BeeDeviceWhisplay:
             battery = self._get_battery() or 0
             ssid = current_wifi_ssid()
             rssi = current_wifi_rssi() if ssid else None
+            status_text = None
+            if self._pisugar_charging():
+                status_text = "charging"
+            elif self._pisugar_plugged():
+                status_text = "plugged in"
             return live_dashboard_frame(
                 battery_percent=battery,
                 frame_index=frame_index,
@@ -291,6 +341,7 @@ class BeeDeviceWhisplay:
                 wifi_connected=ssid is not None,
                 wifi_rssi=rssi,
                 backend_online=self._check_backend_online(),
+                status_text=status_text,
             )
         except Exception as e:
             print(f"Dashboard overlay failed: {e}")
