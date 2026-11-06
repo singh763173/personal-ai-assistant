@@ -574,25 +574,27 @@ def ask_llm(transcript: str) -> str:
     """Send transcript to a conversational LLM and return a spoken reply."""
     now = datetime.now(UTC).strftime("%H:%M:%S UTC on %A, %d %B %Y")
     context_line = f"\nUser context: {BEE_USER_CONTEXT}" if BEE_USER_CONTEXT else ""
-    base_prompt = f"""You are a helpful voice assistant in a wearable device. The user just spoke to you.
-Current date and time: {now}.{context_line}
+    user_prompt = f"""Current date and time: {now}.{context_line}
 
 User's message:
 {transcript}
 
-Give a concise, natural-sounding spoken reply. Use British English spelling and phrasing where natural."""
-    prompt, _ = _augment_prompt_for_live_info(base_prompt, transcript)
+Give a concise, natural-sounding spoken reply."""
+    user_prompt, _ = _augment_prompt_for_live_info(user_prompt, transcript)
     payload = {
         "model": OLLAMA_MODEL,
-        "prompt": prompt,
+        "messages": [
+            {"role": "system", "content": """You are Bee, the user's personal wearable AI assistant. You run privately on their own Bee Pioneer device and homelab infrastructure. Respond as Bee, never as Claude, Anthropic, OpenAI, Kimi, or any other company's AI. Be concise (1-3 sentences by default), warm, and genuinely useful. Use British English spelling and phrasing where natural. You have live web search, current weather, news, and homelab monitoring available. If the user asks for something that needs real-time data, use those tools rather than guessing. You also build skills and routines for the user. If they mention a recurring task, preference, habit, or context they want remembered, offer to capture it as a routine or skill. Stored routines run locally on their Bee Pioneer / homelab stack."""},
+            {"role": "user", "content": user_prompt},
+        ],
         "stream": False,
         "options": {"temperature": 0.7, "num_ctx": 4096},
     }
     try:
-        r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=120)
+        r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=120)
         r.raise_for_status()
         data = r.json()
-        return data.get("response", "").strip()
+        return data.get("message", {}).get("content", "").strip()
     except Exception as e:
         return f"Sorry, I couldn't get a response right now. Error: {e}"
 
@@ -602,16 +604,21 @@ def ask_vision_llm(transcript: str, image_base64: str) -> str:
     """Send image + transcript to a vision model and return a spoken reply."""
     now = datetime.now(UTC).strftime("%H:%M:%S UTC on %A, %d %B %Y")
     context_line = f"\nUser context: {BEE_USER_CONTEXT}" if BEE_USER_CONTEXT else ""
-    base_prompt = f"""You are a helpful voice assistant in a wearable camera. The user took a photo and asked you about it.
-Current date and time: {now}.{context_line}
+    user_prompt = f"""Current date and time: {now}.{context_line}
 
 User question: {transcript}
 
-Describe what you see in the image and answer the question. Reply as if speaking aloud. Keep it concise (2-4 sentences), clear, and friendly. Use British English spelling and phrasing where natural."""
-    prompt, _ = _augment_prompt_for_live_info(base_prompt, transcript)
+Describe what you see in the image and answer the question. Reply as if speaking aloud. Keep it concise (2-4 sentences), clear, and friendly."""
+    user_prompt, _ = _augment_prompt_for_live_info(user_prompt, transcript)
     payload = {
         "model": OLLAMA_VISION_MODEL,
-        "prompt": prompt,
+        "messages": [
+            {"role": "system", "content": """You are Bee, the user's personal wearable AI assistant. You run privately on their own Bee Pioneer device and homelab infrastructure. Respond as Bee, never as Claude, Anthropic, OpenAI, Kimi, or any other company's AI. Be concise (1-3 sentences by default), warm, and genuinely useful. Use British English spelling and phrasing where natural. You have live web search, current weather, news, and homelab monitoring available. If the user asks for something that needs real-time data, use those tools rather than guessing. You also build skills and routines for the user. If they mention a recurring task, preference, habit, or context they want remembered, offer to capture it as a routine or skill. Stored routines run locally on their Bee Pioneer / homelab stack."""},
+            {"role": "user", "content": [
+                {"type": "text", "text": user_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+            ]},
+        ],
         "stream": False,
         "images": [image_base64],
         "options": {"temperature": 0.7, "num_ctx": 4096},
@@ -620,7 +627,7 @@ Describe what you see in the image and answer the question. Reply as if speaking
         r = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=180)
         r.raise_for_status()
         data = r.json()
-        return data.get("response", "").strip()
+        return data.get("message", {}).get("content", "").strip()
     except Exception as e:
         return f"Sorry, I couldn't analyze the image right now. Error: {e}"
 
