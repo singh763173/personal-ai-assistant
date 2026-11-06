@@ -323,6 +323,13 @@ class BeeDeviceWhisplay:
             return False
 
     def _dashboard_overlay(self, frame: Image.Image, frame_index: int) -> Image.Image:
+        # Reassert backlight every frame; the adjacent button pin can momentarily
+        # pull the backlight line low/off, so keep driving it high (on).
+        if self.board and HAS_WHISPLAY:
+            try:
+                self.board.set_backlight(100)
+            except Exception:
+                pass
         if not HAS_LIVE_DASHBOARD:
             return frame
         try:
