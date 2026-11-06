@@ -181,6 +181,7 @@ class BeeDeviceWhisplay:
         "PROCESSING",
         "SPEAKING",
         "RETURN_HOME",
+        "WIFI_SETUP",
         "SHUTDOWN",
     }
 
@@ -196,9 +197,10 @@ class BeeDeviceWhisplay:
         # Button gesture state
         self._press_start = 0.0
         self._long_press_triggered = False
-        self._double_click_window = 0.35
+        self._double_click_window = 0.7
         self._click_count = 0
         self._click_lock = threading.Lock()
+        self._click_event = threading.Event()
 
         # Button debounce: ignore transitions within this window (seconds)
         self._button_debounce = 0.08
@@ -211,8 +213,20 @@ class BeeDeviceWhisplay:
         self._recorder_lock = threading.Lock()
         self._recording_stop_event = threading.Event()
 
+        # Watchdog to recover from backlight being pulled low by adjacent button GPIO short
+        self._display_watchdog_stop = threading.Event()
+        self._display_watchdog_thread = threading.Thread(target=self._display_watchdog, daemon=True)
+
         self._init_whisplay()
         self._init_camera()
+
+        # Wi-Fi manager singleton (created once, reused for triple-click setup mode)
+        self.wifi_manager = create_manager() if HAS_WIFI_MANAGER else None
+
+        # Network watchdog: log backend reachability and try to recover Wi-Fi if lost
+        self._network_watchdog_stop = threading.Event()
+        self._network_watchdog_thread = threading.Thread(target=self._network_watchdog, daemon=True)
+        self._network_watchdog_thread.start()
 
     @property
     def state(self) -> str:
@@ -242,18 +256,46 @@ class BeeDeviceWhisplay:
             self.board = None
 
     def _init_camera(self):
+        """Create camera object but do not keep it running to save power."""
         if not HAS_CAMERA or not ENABLE_CAMERA:
             return
         try:
             self.camera = Picamera2()
             cfg = self.camera.create_still_configuration(main={"size": (1640, 1232)})
             self.camera.configure(cfg)
-            self.camera.start()
-            time.sleep(1)
-            print("Camera initialized.")
+            print("Camera ready (sleeping).")
         except Exception as e:
             print(f"Camera init failed: {e}")
             self.camera = None
+
+    def _capture_image(self) -> Path | None:
+        """Start camera, capture one still, and stop it again."""
+        if not self.camera:
+            return None
+        try:
+            tmp_dir = Path(tempfile.gettempdir()) / "bee-device"
+            tmp_dir.mkdir(exist_ok=True)
+            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+            img_path = tmp_dir / f"{DEVICE_ID}-{stamp}.jpg"
+            self.camera.start()
+            time.sleep(0.8)  # let auto-exposure settle
+            self.camera.capture_file(str(img_path))
+            self.camera.stop()
+            return img_path
+        except Exception as e:
+            print(f"Camera capture failed: {e}")
+            return None
+
+
+    def _display_watchdog(self):
+        """Reassert backlight very frequently to recover from GPIO coupling/noise."""
+        while not self._display_watchdog_stop.is_set():
+            try:
+                if self.board and HAS_WHISPLAY:
+                    self.board.set_backlight(100)
+            except Exception as e:
+                print(f"Display watchdog failed: {e}")
+            self._display_watchdog_stop.wait(0.1)
 
     def _draw_image(self, img: Image.Image):
         if self.board and HAS_PIL:
@@ -278,6 +320,7 @@ class BeeDeviceWhisplay:
                         break
                 return response.decode("utf-8", errors="ignore").strip()
         except Exception as e:
+            print(f"PiSugar cmd '{cmd}' failed: {e}")
             return ""
 
     def _get_battery(self):
@@ -319,7 +362,8 @@ class BeeDeviceWhisplay:
         try:
             r = requests.get(f"{BACKEND_URL}/api/v1/health", timeout=timeout)
             return r.status_code == 200 and r.json().get("status") == "ok"
-        except Exception:
+        except Exception as e:
+            print(f"Backend online check failed: {e}")
             return False
 
     def _dashboard_overlay(self, frame: Image.Image, frame_index: int) -> Image.Image:
@@ -397,6 +441,8 @@ class BeeDeviceWhisplay:
                     self.board.set_rgb(*color)
                 else:
                     self.board.set_rgb(*color)
+                # Ensure backlight stays on after LED update; shared power/GPIO noise can dim it.
+                self.board.set_backlight(100)
             except Exception as e:
                 print(f"LED set failed: {e}")
 
@@ -611,6 +657,12 @@ class BeeDeviceWhisplay:
             self._last_press_time = now
         self._press_start = now
         self._long_press_triggered = False
+        # Reassert backlight immediately; some button transitions can couple onto the backlight line.
+        try:
+            if self.board and HAS_WHISPLAY:
+                self.board.set_backlight(100)
+        except Exception as e:
+            print(f"Backlight reassert on press failed: {e}")
 
     def _on_button_release(self):
         now = time.monotonic()
@@ -618,6 +670,13 @@ class BeeDeviceWhisplay:
             if now - self._last_release_time < self._button_debounce:
                 return
             self._last_release_time = now
+
+        # Reassert backlight after release as well.
+        try:
+            if self.board and HAS_WHISPLAY:
+                self.board.set_backlight(100)
+        except Exception as e:
+            print(f"Backlight reassert on release failed: {e}")
 
         duration = now - self._press_start
         if duration >= LONG_PRESS_SECONDS:
@@ -638,21 +697,39 @@ class BeeDeviceWhisplay:
         with self._click_lock:
             self._click_count += 1
             count = self._click_count
+            self._click_event.set()
             if count == 1:
                 threading.Thread(target=self._handle_click_gesture, daemon=True).start()
 
     def _handle_click_gesture(self):
-        time.sleep(self._double_click_window)
-        with self._click_lock:
-            count = self._click_count
-            self._click_count = 0
+        """Detect single/double/triple clicks with a sliding window.
 
-        if count >= 3:
-            self._on_triple_click()
-        elif count >= 2:
-            self._on_double_click()
-        elif count == 1:
-            self._on_single_click()
+        Each new click extends the decision window from the most recent release,
+        so slower triple-clicks still register.
+        """
+        while True:
+            # Wait the full window; if no new click arrives, decide now.
+            self._click_lock.acquire()
+            start_count = self._click_count
+            self._click_lock.release()
+
+            if self._click_event.wait(timeout=self._double_click_window):
+                self._click_event.clear()
+                # A new press/release happened within the window; loop again to extend it.
+                continue
+
+            # No new click within window: decide gesture.
+            with self._click_lock:
+                count = self._click_count
+                self._click_count = 0
+
+            if count >= 3:
+                self._on_triple_click()
+            elif count >= 2:
+                self._on_double_click()
+            elif count == 1:
+                self._on_single_click()
+            return
 
     def _on_single_click(self):
         if self.state != "DASHBOARD":
@@ -660,18 +737,34 @@ class BeeDeviceWhisplay:
         self._enter_listening()
 
     def _on_triple_click(self):
-        if not HAS_WIFI_MANAGER:
+        if not HAS_WIFI_MANAGER or not self.wifi_manager:
             print("WiFi manager not available")
+            return
+        if self.state == "WIFI_SETUP":
+            print("Already in WiFi setup mode")
             return
         print("Triple click: entering WiFi setup mode")
         self._set_state("WIFI_SETUP")
         self.gif.stop()
-        self._set_rgb(0, 0, 255)
-        # Do not call board.cleanup() here — it releases the backlight GPIO
-        # and leaves the screen permanently off after setup.  Keep the last
-        # frame displayed instead.
+        # Show a clear visual: white screen with setup label
         try:
-            self.wifi_manager = create_manager()
+            from PIL import Image, ImageDraw, ImageFont
+            img = Image.new("RGB", (240, 280), (255, 255, 255))
+            draw = ImageDraw.Draw(img)
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+                small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+            except Exception:
+                font = small = ImageFont.load_default()
+            draw.text((120, 100), "Wi-Fi Setup", fill=(0, 0, 0), font=font, anchor="mm")
+            draw.text((120, 140), "AP: bee-config", fill=(0, 0, 0), font=small, anchor="mm")
+            draw.text((120, 165), "http://192.168.4.1:8080", fill=(0, 0, 255), font=small, anchor="mm")
+            self._draw_image(img)
+            self._set_rgb(255, 0, 255)
+        except Exception as e:
+            print(f"Setup screen failed: {e}")
+            self._set_rgb(0, 0, 255)
+        try:
             self.wifi_manager.enter_setup_mode()
         except Exception as e:
             print(f"Failed to start setup mode: {e}")
@@ -694,16 +787,42 @@ class BeeDeviceWhisplay:
         os.system("sudo shutdown -h now")
         time.sleep(10)
 
+    def _network_watchdog(self):
+        """Log backend reachability and try to restart Wi-Fi if unreachable."""
+        fail_count = 0
+        while not self._network_watchdog_stop.is_set():
+            self._network_watchdog_stop.wait(60)
+            if self._network_watchdog_stop.is_set():
+                return
+            reachable = self._check_backend_online()
+            if reachable:
+                if fail_count:
+                    print("[NET] Backend reachable again")
+                fail_count = 0
+            else:
+                fail_count += 1
+                print(f"[NET] Backend unreachable ({fail_count}/3)")
+                if fail_count >= 3:
+                    print("[NET] Attempting Wi-Fi recovery")
+                    try:
+                        subprocess.run(["sudo", "nmcli", "connection", "up", "netplan-wlan0-IoT-Network"], timeout=30, check=False)
+                    except Exception as e:
+                        print(f"[NET] Wi-Fi recovery failed: {e}")
+                    fail_count = 0
+
     def run(self):
         print(f"Bee device {DEVICE_ID} starting. Backend: {BACKEND_URL}")
         print("Single click = voice, Double click = photo+voice, Triple click = WiFi setup, Long press = shutdown")
         self._enter_dashboard()
+        self._display_watchdog_thread.start()
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
             print("Shutting down...")
         finally:
+            self._display_watchdog_stop.set()
+            self._network_watchdog_stop.set()
             self.gif.stop()
             self._set_rgb(0, 0, 0)
             if self.board:

@@ -22,6 +22,7 @@ WPA_SUPPLICANT_CONF = Path("/etc/wpa_supplicant/wpa_supplicant.conf")
 COUNTRY_CODE = os.getenv("BEE_WIFI_COUNTRY", "GB")
 SETUP_SSID = os.getenv("BEE_SETUP_SSID", "bee-config")
 SETUP_IP = "192.168.4.1"
+SETUP_PORT = int(os.getenv("BEE_SETUP_PORT", "8080"))
 
 app = Flask(__name__)
 _wifi_manager = None
@@ -72,13 +73,20 @@ class WiFiManager:
         self.setup_mode = False
         self._setup_thread = None
         self._setup_running = threading.Event()
+        self._setup_lock = threading.Lock()
 
     @staticmethod
     def _load_known():
         if not KNOWN_WIFI_PATH.exists():
             return []
         try:
-            data = json.loads(KNOWN_WIFI_PATH.read_text())
+            # If the service user cannot read the file, try via sudo-cat.
+            if os.access(KNOWN_WIFI_PATH, os.R_OK):
+                raw = KNOWN_WIFI_PATH.read_text()
+            else:
+                res = _run(f"sudo cat {KNOWN_WIFI_PATH}")
+                raw = res.stdout if res.returncode == 0 else "[]"
+            data = json.loads(raw)
             if isinstance(data, list):
                 return data
         except Exception as e:
@@ -86,8 +94,12 @@ class WiFiManager:
         return []
 
     def _save_known(self):
-        KNOWN_WIFI_PATH.parent.mkdir(parents=True, exist_ok=True)
-        KNOWN_WIFI_PATH.write_text(json.dumps(self.known_networks, indent=2))
+        """Persist known networks to JSON via sudo so the service user can write it."""
+        tmp = Path("/tmp/known_wifi.json")
+        tmp.write_text(json.dumps(self.known_networks, indent=2))
+        _run(f"sudo mkdir -p {KNOWN_WIFI_PATH.parent}")
+        _run(f"sudo cp {tmp} {KNOWN_WIFI_PATH}")
+        _run(f"sudo chmod 644 {KNOWN_WIFI_PATH}")
 
     def apply_known_networks(self):
         """Regenerate wpa_supplicant.conf from known networks.
@@ -151,12 +163,19 @@ class WiFiManager:
 
     def _configure_ap(self):
         """Stop client mode and start hostapd/dnsmasq."""
+        _run("sudo rfkill unblock wifi 2>/dev/null || true")
+        # NetworkManager will fight hostapd for wlan0; disable it during setup.
+        _run("sudo systemctl stop NetworkManager 2>/dev/null || true")
         _run("sudo systemctl stop dhcpcd 2>/dev/null || true")
         _run("sudo systemctl stop wpa_supplicant 2>/dev/null || true")
+        _run("sudo pkill -9 wpa_supplicant 2>/dev/null || true")
+        _run("sudo pkill -9 dhcpcd 2>/dev/null || true")
         _run("sudo ip link set wlan0 down")
+        time.sleep(0.5)
         _run("sudo ip addr flush dev wlan0")
         _run(f"sudo ip addr add {SETUP_IP}/24 dev wlan0")
         _run("sudo ip link set wlan0 up")
+        time.sleep(0.5)
 
         # hostapd config
         hostapd_conf = f"""interface=wlan0
@@ -198,14 +217,21 @@ address=/#/{SETUP_IP}
 
     def enter_setup_mode(self):
         """Start AP and web UI."""
-        if self._setup_running.is_set():
-            return
-        self._setup_running.set()
+        with self._setup_lock:
+            if self._setup_running.is_set():
+                print("Setup mode already running")
+                return
+            self._setup_running.set()
         self.setup_mode = True
-        self._configure_ap()
+        try:
+            self._configure_ap()
+        except Exception as e:
+            print(f"AP configuration failed: {e}")
+            self._setup_running.clear()
+            raise
         self._setup_thread = threading.Thread(
             target=app.run,
-            kwargs={"host": SETUP_IP, "port": 80, "debug": False, "use_reloader": False},
+            kwargs={"host": SETUP_IP, "port": SETUP_PORT, "debug": False, "use_reloader": False},
             daemon=True,
         )
         self._setup_thread.start()
@@ -231,61 +257,269 @@ address=/#/{SETUP_IP}
 
 @app.route("/", methods=["GET"])
 def index():
-    known_html = "".join(f"<li>{n['ssid']}</li>" for n in _wifi_manager.known_networks)
+    if _wifi_manager.known_networks:
+        known_html = "".join(f"<li>{n['ssid']}</li>" for n in _wifi_manager.known_networks)
+    else:
+        known_html = "<li style='color:#71717a;list-style:none;margin-left:-1.25rem;'>No saved networks yet</li>"
     return f"""<!doctype html>
-<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bee WiFi Setup</title>
-<style>body{{font-family:sans-serif;padding:1rem;max-width:400px;margin:auto}}input,button{{width:100%;padding:0.7rem;margin:0.4rem 0;font-size:1rem}}button{{background:#111;color:#fff;border:none;border-radius:0.4rem}}</style></head>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bee Wi-Fi Setup</title>
+<style>
+  :root {{
+    --bg: #0f0f10;
+    --card: #18181b;
+    --text: #f4f4f5;
+    --muted: #a1a1aa;
+    --accent: #fbbf24;
+    --accent-dark: #d97706;
+    --border: #27272a;
+    --input: #27272a;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 2rem 1rem;
+    min-height: 100vh;
+  }}
+  .card {{
+    width: 100%;
+    max-width: 420px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 1.25rem;
+    padding: 1.75rem;
+    box-shadow: 0 20px 40px rgba(0,0,0,0.35);
+  }}
+  .logo {{
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0.5rem;
+  }}
+  .logo-icon {{
+    width: 2.5rem;
+    height: 2.5rem;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-dark) 100%);
+    border-radius: 0.75rem;
+    display: grid;
+    place-items: center;
+    font-size: 1.4rem;
+  }}
+  h1 {{
+    font-size: 1.35rem;
+    font-weight: 700;
+    margin: 0;
+    letter-spacing: -0.02em;
+  }}
+  .tagline {{
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin-bottom: 1.5rem;
+  }}
+  label {{
+    display: block;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin: 1rem 0 0.4rem;
+  }}
+  input {{
+    width: 100%;
+    padding: 0.85rem 1rem;
+    background: var(--input);
+    border: 1px solid var(--border);
+    border-radius: 0.75rem;
+    color: var(--text);
+    font-size: 1rem;
+    outline: none;
+    transition: border-color 0.15s;
+  }}
+  input:focus {{
+    border-color: var(--accent);
+  }}
+  .optional {{
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+    color: #71717a;
+  }}
+  button {{
+    width: 100%;
+    margin-top: 1.5rem;
+    padding: 0.95rem;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-dark) 100%);
+    color: #1a1a1a;
+    border: none;
+    border-radius: 0.75rem;
+    font-size: 1rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform 0.1s, box-shadow 0.15s;
+  }}
+  button:hover {{
+    transform: translateY(-1px);
+    box-shadow: 0 8px 20px rgba(251, 191, 36, 0.25);
+  }}
+  .known {{
+    margin-top: 1.75rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--border);
+  }}
+  .known h3 {{
+    margin: 0 0 0.75rem;
+    font-size: 0.9rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }}
+  .known ul {{
+    margin: 0;
+    padding-left: 1.25rem;
+    color: var(--text);
+  }}
+  .known li {{
+    margin: 0.35rem 0;
+    font-size: 0.95rem;
+  }}
+  .status {{
+    margin-top: 1rem;
+    padding: 0.85rem 1rem;
+    background: rgba(251, 191, 36, 0.1);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 0.5rem 0.5rem 0;
+    color: var(--text);
+    font-size: 0.9rem;
+  }}
+</style>
+</head>
 <body>
-<h2>🐝 Bee WiFi Setup</h2>
-<form method="post" action="/connect">
-<label>WiFi SSID<br><input name="ssid" required placeholder="Network name"></label><br>
-<label>Passphrase<br><input name="psk" type="password" required placeholder="Password"></label><br>
-<label>Backend URL (optional)<br><input name="backend_url" placeholder="https://..." value=""></label><br>
-<label>API Key (optional)<br><input name="api_key" placeholder="" value=""></label><br>
-<button type="submit">Connect & Save</button>
-</form>
-<h3>Known networks</h3>
-<ul>{known_html}</ul>
-</body></html>"""
+  <div class="card">
+    <div class="logo">
+      <div class="logo-icon">🐝</div>
+      <div>
+        <h1>Bee Wi-Fi Setup</h1>
+        <div class="tagline">Connect your wearable to the world</div>
+      </div>
+    </div>
+    <div class="status">
+      You are connected to <strong>bee-config</strong>. Fill in your home network details below and the Bee will restart automatically.
+    </div>
+    <form method="post" action="/connect">
+      <label for="ssid">Wi-Fi Network</label>
+      <input id="ssid" name="ssid" required placeholder="e.g. HomeNetwork">
+
+      <label for="psk">Passphrase</label>
+      <input id="psk" name="psk" type="password" required placeholder="Your Wi-Fi password">
+
+      <label for="backend_url" class="optional">Backend URL <span style="color:#71717a">(optional)</span></label>
+      <input id="backend_url" name="backend_url" placeholder="https://bee-api.singhdns.co.uk">
+
+      <label for="api_key" class="optional">API Key <span style="color:#71717a">(optional)</span></label>
+      <input id="api_key" name="api_key" placeholder="bee_...">
+
+      <button type="submit">Connect &amp; Save</button>
+    </form>
+    <div class="known">
+      <h3>Saved Networks</h3>
+      <ul>{known_html}</ul>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+result_page = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bee Wi-Fi Setup</title>
+<style>
+  :root {{ --bg:#0f0f10; --card:#18181b; --text:#f4f4f5; --muted:#a1a1aa; --accent:#fbbf24; --accent-dark:#d97706; --border:#27272a; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; display:flex; justify-content:center; align-items:center; min-height:100vh; padding:1rem; }}
+  .card {{ width:100%; max-width:420px; background:var(--card); border:1px solid var(--border); border-radius:1.25rem; padding:2rem; text-align:center; box-shadow:0 20px 40px rgba(0,0,0,0.35); }}
+  .icon {{ width:4rem; height:4rem; background:linear-gradient(135deg,var(--accent) 0%,var(--accent-dark) 100%); border-radius:50%; display:grid; place-items:center; margin:0 auto 1.25rem; font-size:2rem; }}
+  h1 {{ font-size:1.35rem; margin:0 0 0.5rem; }}
+  p {{ color:var(--muted); margin:0 0 1.5rem; line-height:1.5; }}
+  a {{ display:inline-block; padding:0.75rem 1.25rem; background:var(--border); color:var(--text); text-decoration:none; border-radius:0.75rem; font-weight:600; }}
+  a:hover {{ background:#3f3f46; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">{icon}</div>
+    <h1>{title}</h1>
+    <p>{message}</p>
+    {back_link}
+  </div>
+</body>
+</html>"""
 
 
 @app.route("/connect", methods=["POST"])
 def connect():
-    ssid = request.form.get("ssid", "").strip()
-    psk = request.form.get("psk", "").strip()
-    backend_url = request.form.get("backend_url", "").strip()
-    api_key = request.form.get("api_key", "").strip()
-    if not ssid or not psk:
-        return "SSID and passphrase required", 400
+    try:
+        ssid = request.form.get("ssid", "").strip()
+        psk = request.form.get("psk", "").strip()
+        backend_url = request.form.get("backend_url", "").strip()
+        api_key = request.form.get("api_key", "").strip()
+        if not ssid or not psk:
+            return "SSID and passphrase required", 400
 
-    ok = _wifi_manager.add_network(ssid, psk)
+        ok = _wifi_manager.add_network(ssid, psk)
 
-    # Update device env if provided
-    env_path = Path("/opt/bee-device/.env")
-    if env_path.exists() and (backend_url or api_key):
-        lines = env_path.read_text().splitlines()
-        new_lines = []
-        for line in lines:
-            if backend_url and line.startswith("BEE_BACKEND_URL="):
-                line = f"BEE_BACKEND_URL={backend_url}"
-            if api_key and line.startswith("BEE_API_KEY="):
-                line = f"BEE_API_KEY={api_key}"
-            new_lines.append(line)
-        if backend_url and not any(line2.startswith("BEE_BACKEND_URL=") for line2 in new_lines):
-            new_lines.append(f"BEE_BACKEND_URL={backend_url}")
-        if api_key and not any(line2.startswith("BEE_API_KEY=") for line2 in new_lines):
-            new_lines.append(f"BEE_API_KEY={api_key}")
-        env_path.write_text("\n".join(new_lines) + "\n")
+        # Update device env if provided (write as service user then sudo mv)
+        env_path = Path("/opt/bee-device/.env")
+        if env_path.exists() and (backend_url or api_key):
+            try:
+                lines = env_path.read_text().splitlines()
+                new_lines = []
+                for line in lines:
+                    if backend_url and line.startswith("BEE_BACKEND_URL="):
+                        line = f"BEE_BACKEND_URL={backend_url}"
+                    if api_key and line.startswith("BEE_API_KEY="):
+                        line = f"BEE_API_KEY={api_key}"
+                    new_lines.append(line)
+                if backend_url and not any(line2.startswith("BEE_BACKEND_URL=") for line2 in new_lines):
+                    new_lines.append(f"BEE_BACKEND_URL={backend_url}")
+                if api_key and not any(line2.startswith("BEE_API_KEY=") for line2 in new_lines):
+                    new_lines.append(f"BEE_API_KEY={api_key}")
+                tmp_env = Path("/tmp/bee-device.env")
+                tmp_env.write_text("\n".join(new_lines) + "\n")
+                _run(f"sudo cp {tmp_env} {env_path}")
+                _run(f"sudo chmod 644 {env_path}")
+            except Exception as e:
+                print(f"Env update failed (ignored): {e}")
 
-    if ok:
-
-        def _reconnect():
-            _wifi_manager.leave_setup_mode()
-            os.system("sudo systemctl restart bee-device")
-
+        # Always reboot after saving; the device cannot test the network while it is the AP.
         threading.Thread(target=_reconnect, daemon=True).start()
-        return "<h2>Connected! Rebooting device...</h2><p>You can close this page.</p>"
-    return "<h2>Could not connect.</h2><p>The network has been saved; the device will retry on next boot. <a href='/'>Back</a></p>"
+        if ok:
+            return result_page.format(icon="✅", title="Saved & connected", message="The Bee will restart and join your Wi-Fi. You can close this page.", back_link="")
+        return result_page.format(icon="💾", title="Network saved", message="The Bee will reboot and try to join the network. If it fails, triple-click the button to re-enter setup.", back_link='<a href="/">Back</a>')
+    except Exception as e:
+        import traceback
+        print(f"/connect error: {e}\n{traceback.format_exc()}")
+        return f"<h2>Server Error</h2><pre>{e}</pre><p><a href='/'>Back</a></p>", 500
+
+
+def _reconnect():
+    """Leave setup mode and restart the device service to apply new network/env."""
+    try:
+        _wifi_manager.leave_setup_mode()
+    except Exception as e:
+        print(f"leave_setup_mode failed: {e}")
+    os.system("sudo systemctl restart bee-device")
 
 
 def create_manager():

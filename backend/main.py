@@ -342,6 +342,8 @@ Use the web search results above to answer the user's question. If the results a
 MAX_UPLOAD_BYTES = int(os.getenv("BEE_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 MAX_DEVICES = int(os.getenv("BEE_MAX_DEVICES", "50"))
 RATE_LIMIT_SECONDS = float(os.getenv("BEE_RATE_LIMIT_SECONDS", "5"))
+MAX_TRANSCRIPT_CHARS = int(os.getenv("BEE_MAX_TRANSCRIPT_CHARS", "4000"))
+CONVERSATION_RETENTION_DAYS = int(os.getenv("BEE_CONVERSATION_RETENTION_DAYS", "90"))
 
 if not SECRET_KEY:
     SECRET_KEY = secrets.token_urlsafe(32)
@@ -694,10 +696,11 @@ async def _generate_tts(conversation_id: int, text: str) -> str:
         return ""
     out_dir = Path(__file__).parent / "audio_replies"
     out_dir.mkdir(exist_ok=True)
-    out_path = out_dir / f"{conversation_id}.mp3"
+    token = secrets.token_urlsafe(16)
+    out_path = out_dir / f"{conversation_id}-{token}.mp3"
     success = await text_to_speech(text, out_path)
     if success:
-        return f"/api/v1/audio/{conversation_id}.mp3"
+        return f"/api/v1/audio/{conversation_id}/{token}.mp3"
     return ""
 
 
@@ -996,14 +999,15 @@ async def ask_endpoint(
             db.commit()
             db.refresh(conv)
 
-            # Rename MP3 to use conversation id for easy serving
-            final_mp3_path = audio_dir / f"{conv.id}.mp3"
+            # Use a random token so audio replies are not enumerable
+            audio_token = secrets.token_urlsafe(16)
+            final_mp3_path = audio_dir / f"{conv.id}-{audio_token}.mp3"
             if tts_ok:
                 mp3_path.rename(final_mp3_path)
             else:
                 final_mp3_path = None
 
-            audio_url = f"/api/v1/audio/{conv.id}.mp3" if final_mp3_path and final_mp3_path.exists() else None
+            audio_url = f"/api/v1/audio/{conv.id}/{audio_token}.mp3" if final_mp3_path and final_mp3_path.exists() else None
 
             return UploadResponse(
                 conversation_id=conv.id,
@@ -1019,11 +1023,14 @@ async def ask_endpoint(
         wav_path.unlink(missing_ok=True)
 
 
-@app.get("/api/v1/audio/{conversation_id}.mp3")
-async def get_audio_reply(conversation_id: int):
-    audio_path = Path(__file__).parent / "audio_replies" / f"{conversation_id}.mp3"
-    if not audio_path.exists():
+@app.get("/api/v1/audio/{conversation_id}/{token}.mp3")
+async def get_audio_reply(conversation_id: int, token: str):
+    audio_dir = Path(__file__).parent / "audio_replies"
+    # Find a file matching conversation_id and token prefix
+    candidates = [p for p in audio_dir.glob(f"{conversation_id}-{token}*.mp3")]
+    if not candidates:
         raise HTTPException(status_code=404, detail="Audio reply not found")
+    audio_path = candidates[0]
     return FileResponse(audio_path, media_type="audio/mpeg", filename=f"reply-{conversation_id}.mp3")
 
 
@@ -1135,6 +1142,19 @@ def _cleanup_old_files():
                     p.unlink()
             except Exception as e:
                 print(f"Cleanup audio failed for {p}: {e}")
+
+    # Prune conversation database entries older than retention
+    if CONVERSATION_RETENTION_DAYS > 0:
+        try:
+            cutoff = datetime.now(UTC) - timedelta(days=CONVERSATION_RETENTION_DAYS)
+            db = next(get_db())
+            try:
+                db.query(Conversation).filter(Conversation.created_at < cutoff).delete(synchronize_session=False)
+                db.commit()
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"Cleanup DB prune failed: {e}")
 
 
 @app.middleware("http")
