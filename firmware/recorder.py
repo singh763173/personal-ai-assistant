@@ -330,9 +330,7 @@ class BeeDeviceWhisplay:
             ssid = current_wifi_ssid()
             rssi = current_wifi_rssi() if ssid else None
             status_text = None
-            if self._pisugar_charging():
-                status_text = "charging"
-            elif self._pisugar_plugged():
+            if not self._pisugar_charging() and self._pisugar_plugged():
                 status_text = "plugged in"
             return live_dashboard_frame(
                 battery_percent=battery,
@@ -342,6 +340,7 @@ class BeeDeviceWhisplay:
                 wifi_rssi=rssi,
                 backend_online=self._check_backend_online(),
                 status_text=status_text,
+                charging=self._pisugar_charging(),
             )
         except Exception as e:
             print(f"Dashboard overlay failed: {e}")

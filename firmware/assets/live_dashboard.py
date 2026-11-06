@@ -157,6 +157,7 @@ def live_dashboard_frame(
     wifi_rssi: int | None = None,
     backend_online: bool = True,
     status_text: str | None = None,
+    charging: bool = False,
 ) -> Image.Image:
     """Return one clock/battery/WiFi/backend-updated dashboard frame.
 
@@ -168,6 +169,7 @@ def live_dashboard_frame(
         wifi_rssi: dBm signal strength, e.g. -45 for excellent.
         backend_online: Whether the backend was reachable recently.
         status_text: Optional short message shown at the bottom.
+        charging: Whether the battery is currently charging.
     """
     gif = Path(animation_file) if animation_file else HERE / "dashboard_background_clean.gif"
     _cache.load(gif)
@@ -190,14 +192,53 @@ def live_dashboard_frame(
     battery = max(0, min(100, int(battery_percent)))
     batt_colour = _battery_color(battery)
     d.text((172, 11), f"{battery}%", font=_cache.font_tiny, fill=WHITE)
-    # Battery body
-    d.rounded_rectangle((202, 11, 226, 21), radius=3, outline=MUTED, width=1)
-    # Battery nib
-    d.rounded_rectangle((226, 14, 230, 18), radius=1, fill=MUTED)
-    # Fill
-    fill_width = round(battery / 100 * 20)
+
+    # Battery body (24x10) with 2px rounded nib on the right
+    body_x, body_y = 202, 11
+    body_w, body_h = 24, 10
+    d.rounded_rectangle((body_x, body_y, body_x + body_w, body_y + body_h), radius=3, outline=MUTED, width=1)
+    # Positive nib
+    nib_w, nib_h = 3, 4
+    d.rounded_rectangle(
+        (body_x + body_w, body_y + (body_h - nib_h) // 2, body_x + body_w + nib_w, body_y + (body_h - nib_h) // 2 + nib_h),
+        radius=1,
+        fill=MUTED,
+    )
+
+    # Fill inside the body with 2px padding on all sides
+    fill_padding = 2
+    max_fill_w = body_w - fill_padding * 2
+    fill_h = body_h - fill_padding * 2
+    fill_x = body_x + fill_padding
+    fill_y = body_y + fill_padding
+    fill_width = round(battery / 100 * max_fill_w)
     if fill_width > 0:
-        d.rounded_rectangle((208, 13, 208 + fill_width, 19), radius=2, fill=batt_colour)
+        # Pulse the fill slightly when charging so it looks alive
+        if charging and frame_index % 30 < 15:
+            fill_colour = CYAN
+        else:
+            fill_colour = batt_colour
+        d.rounded_rectangle(
+            (fill_x, fill_y, fill_x + fill_width, fill_y + fill_h),
+            radius=1,
+            fill=fill_colour,
+        )
+
+    # Charging bolt overlay when plugged in and charging
+    if charging:
+        bolt_colour = WHITE
+        bolt_x = body_x + body_w // 2
+        bolt_y = body_y + body_h // 2
+        # Small lightning-bolt polygon centered on the battery
+        bolt = [
+            (bolt_x - 1, bolt_y - 3),
+            (bolt_x + 3, bolt_y - 1),
+            (bolt_x + 1, bolt_y - 1),
+            (bolt_x + 2, bolt_y + 1),
+            (bolt_x - 2, bolt_y + 3),
+            (bolt_x, bolt_y),
+        ]
+        d.polygon(bolt, fill=bolt_colour)
 
     # ---- Clock and date ----
     # Positioned high so it does not cover the mascot's face
