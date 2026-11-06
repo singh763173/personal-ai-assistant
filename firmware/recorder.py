@@ -198,6 +198,12 @@ class BeeDeviceWhisplay:
         self._click_count = 0
         self._click_lock = threading.Lock()
 
+        # Button debounce: ignore transitions within this window (seconds)
+        self._button_debounce = 0.08
+        self._last_press_time = 0.0
+        self._last_release_time = 0.0
+        self._button_state_lock = threading.Lock()
+
         self._recorder_proc = None
         self._recorder_path = None
         self._recorder_lock = threading.Lock()
@@ -541,16 +547,31 @@ class BeeDeviceWhisplay:
     # ---- Button handling ----
 
     def _on_button_press(self):
-        self._press_start = time.monotonic()
+        now = time.monotonic()
+        with self._button_state_lock:
+            if now - self._last_press_time < self._button_debounce:
+                return
+            self._last_press_time = now
+        self._press_start = now
         self._long_press_triggered = False
 
     def _on_button_release(self):
         now = time.monotonic()
+        with self._button_state_lock:
+            if now - self._last_release_time < self._button_debounce:
+                return
+            self._last_release_time = now
+
         duration = now - self._press_start
         if duration >= LONG_PRESS_SECONDS:
             if not self._long_press_triggered:
                 self._long_press_triggered = True
                 self._on_long_press()
+            return
+
+        # Require a minimum press time to count as an intentional click.
+        # Bounce/noise can produce sub-50 ms press/release pairs.
+        if duration < 0.05:
             return
 
         # If in camera voice mode, signal recording to stop on release
@@ -589,9 +610,9 @@ class BeeDeviceWhisplay:
         self._set_state("WIFI_SETUP")
         self.gif.stop()
         self._set_rgb(0, 0, 255)
-        with contextlib.suppress(Exception):
-            if self.board:
-                self.board.cleanup()
+        # Do not call board.cleanup() here — it releases the backlight GPIO
+        # and leaves the screen permanently off after setup.  Keep the last
+        # frame displayed instead.
         try:
             self.wifi_manager = create_manager()
             self.wifi_manager.enter_setup_mode()
